@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.tmp/
+
+# Webpack reports
+webpack.statistics.*.html
+
+# IDE
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

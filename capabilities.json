@@ -1,0 +1,166 @@
+{
+    "dataRoles": [
+        {
+            "displayName": "省份",
+            "displayNameKey": "Role_Province",
+            "name": "province",
+            "kind": "Grouping",
+            "description": "省份/直辖市/自治区名称（如：广东省、北京市）"
+        },
+        {
+            "displayName": "城市",
+            "displayNameKey": "Role_City",
+            "name": "city",
+            "kind": "Grouping",
+            "description": "地级市名称（下钻第二级，如：深圳市、杭州市）"
+        },
+        {
+            "displayName": "区县",
+            "displayNameKey": "Role_District",
+            "name": "district",
+            "kind": "Grouping",
+            "description": "区/县名称（下钻第三级，如：南山区、西湖区）"
+        },
+        {
+            "displayName": "度量值",
+            "displayNameKey": "Role_Measure",
+            "name": "measure",
+            "kind": "Measure",
+            "description": "地图填充数值"
+        },
+        {
+            "displayName": "工具提示",
+            "displayNameKey": "Role_Tooltips",
+            "name": "tooltips",
+            "kind": "Measure",
+            "description": "鼠标悬停时显示的额外字段"
+        }
+    ],
+    "objects": {
+        "mapColor": {
+            "displayName": "地图配色",
+            "properties": {
+                "minColor": {
+                    "displayName": "最小值颜色",
+                    "type": { "fill": { "solid": { "color": true } } }
+                },
+                "maxColor": {
+                    "displayName": "最大值颜色",
+                    "type": { "fill": { "solid": { "color": true } } }
+                },
+                "bgColor": {
+                    "displayName": "背景色",
+                    "type": { "fill": { "solid": { "color": true } } }
+                },
+                "borderColor": {
+                    "displayName": "边界颜色",
+                    "type": { "fill": { "solid": { "color": true } } }
+                },
+                "minValue": {
+                    "displayName": "最小值",
+                    "type": { "numeric": true }
+                },
+                "maxValue": {
+                    "displayName": "最大值",
+                    "type": { "numeric": true }
+                }
+            }
+        },
+        "mapLabels": {
+            "displayName": "标签设置",
+            "properties": {
+                "show": {
+                    "displayName": "显示标签",
+                    "type": { "bool": true }
+                },
+                "fontSize": {
+                    "displayName": "字号",
+                    "type": { "numeric": true }
+                },
+                "fontColor": {
+                    "displayName": "字体颜色",
+                    "type": { "fill": { "solid": { "color": true } } }
+                },
+                "showValue": {
+                    "displayName": "显示数值",
+                    "type": { "bool": true }
+                }
+            }
+        },
+        "mapTooltip": {
+            "displayName": "提示框",
+            "properties": {
+                "show": {
+                    "displayName": "显示提示框",
+                    "type": { "bool": true }
+                }
+            }
+        },
+        "mapConfig": {
+            "displayName": "地图配置",
+            "properties": {
+                "roam": {
+                    "displayName": "允许缩放和平移",
+                    "type": { "bool": true }
+                },
+                "showLegend": {
+                    "displayName": "显示图例条",
+                    "type": { "bool": true }
+                },
+                "showBreadcrumb": {
+                    "displayName": "显示面包屑导航",
+                    "type": { "bool": true }
+                },
+                "southChinaSeaMode": {
+                    "displayName": "南海诸岛显示方式",
+                    "type": {
+                        "enumeration": [
+                            { "displayName": "完整显示", "value": "full" },
+                            { "displayName": "小图显示", "value": "inset" }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    "dataViewMappings": [
+        {
+            "conditions": [
+                {
+                    "province": { "max": 1 },
+                    "city": { "max": 1 },
+                    "district": { "max": 1 },
+                    "measure": { "max": 1 },
+                    "tooltips": { "max": 5 }
+                }
+            ],
+            "categorical": {
+                "categories": {
+                    "select": [
+                        { "for": { "in": "province" } },
+                        { "for": { "in": "city" } },
+                        { "for": { "in": "district" } }
+                    ]
+                },
+                "values": {
+                    "select": [
+                        { "bind": { "to": "measure" } },
+                        { "for": { "in": "tooltips" } }
+                    ],
+                    "dataReductionAlgorithm": {
+                        "top": { "count": 50000 }
+                    }
+                }
+            }
+        }
+    ],
+    "privileges": [
+        {
+            "name": "WebAccess",
+            "essential": true,
+            "parameters": [
+                "https://geo.datav.aliyun.com"
+            ]
+        }
+    ]
+}
