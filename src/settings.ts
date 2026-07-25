@@ -72,6 +72,17 @@ class MapLabelsCardSettings extends FormattingSettingsCard {
         value: true
     });
 
+    labelContent = new formattingSettings.ItemDropdown({
+        name: "labelContent",
+        displayName: "标签内容",
+        items: [
+            { displayName: "区域名称", value: "name" },
+            { displayName: "数值", value: "value" },
+            { displayName: "名称 + 数值", value: "nameAndValue" }
+        ],
+        value: { displayName: "区域名称", value: "name" } as any
+    });
+
     fontSize = new formattingSettings.NumUpDown({
         name: "fontSize",
         displayName: "字号",
@@ -84,19 +95,13 @@ class MapLabelsCardSettings extends FormattingSettingsCard {
         value: { value: "#333333" }
     });
 
-    showValue = new formattingSettings.ToggleSwitch({
-        name: "showValue",
-        displayName: "显示数值",
-        value: false
-    });
-
     name: string = "mapLabels";
     displayName: string = "标签设置";
     slices: Array<FormattingSettingsSlice> = [
         this.show,
+        this.labelContent,
         this.fontSize,
-        this.fontColor,
-        this.showValue
+        this.fontColor
     ];
 }
 

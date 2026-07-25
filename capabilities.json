@@ -22,18 +22,18 @@
             "description": "区/县名称（下钻第三级，如：南山区、西湖区）"
         },
         {
-            "displayName": "度量值",
+            "displayName": "数值",
             "displayNameKey": "Role_Measure",
             "name": "measure",
             "kind": "Measure",
-            "description": "地图填充数值"
+            "description": "地图填充色数值（驱动颜色渐变和标签显示）"
         },
         {
             "displayName": "工具提示",
             "displayNameKey": "Role_Tooltips",
             "name": "tooltips",
             "kind": "Measure",
-            "description": "鼠标悬停时显示的额外字段"
+            "description": "鼠标悬停时显示的额外度量字段"
         }
     ],
     "objects": {
@@ -73,6 +73,16 @@
                     "displayName": "显示标签",
                     "type": { "bool": true }
                 },
+                "labelContent": {
+                    "displayName": "标签内容",
+                    "type": {
+                        "enumeration": [
+                            { "displayName": "区域名称", "value": "name" },
+                            { "displayName": "数值", "value": "value" },
+                            { "displayName": "名称 + 数值", "value": "nameAndValue" }
+                        ]
+                    }
+                },
                 "fontSize": {
                     "displayName": "字号",
                     "type": { "numeric": true }
@@ -80,10 +90,6 @@
                 "fontColor": {
                     "displayName": "字体颜色",
                     "type": { "fill": { "solid": { "color": true } } }
-                },
-                "showValue": {
-                    "displayName": "显示数值",
-                    "type": { "bool": true }
                 }
             }
         },
@@ -157,7 +163,7 @@
     "privileges": [
         {
             "name": "WebAccess",
-            "essential": true,
+            "essential": false,
             "parameters": [
                 "https://geo.datav.aliyun.com"
             ]

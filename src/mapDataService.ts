@@ -1,7 +1,25 @@
 /**
  * 地图数据服务 - 负责获取和缓存 GeoJSON 地图数据
- * 数据源：阿里云 DataV.GeoAtlas（高德开放数据）
+ * 优先使用打包的本地数据（确保 Power BI Service 离线可用）
+ * 回退数据源：阿里云 DataV.GeoAtlas
  */
+
+// ── 打包的本地 GeoJSON 数据（用 require 确保 webpack 兼容）──
+/* eslint-disable @typescript-eslint/no-var-requires */
+declare const require: (module: string) => any;
+const chinaGeo = require("./assets/china.json");
+const guangdongGeo = require("./assets/guangdong.json");
+const zhejiangGeo = require("./assets/zhejiang.json");
+const jiangsuGeo = require("./assets/jiangsu.json");
+const beijingGeo = require("./assets/beijing.json");
+const shanghaiGeo = require("./assets/shanghai.json");
+const sichuanGeo = require("./assets/sichuan.json");
+const hubeiGeo = require("./assets/hubei.json");
+const shandongGeo = require("./assets/shandong.json");
+const hunanGeo = require("./assets/hunan.json");
+const fujianGeo = require("./assets/fujian.json");
+const henanGeo = require("./assets/henan.json");
+const shaanxiGeo = require("./assets/shaanxi.json");
 
 export interface DrillState {
     /** 当前层级：1=全国, 2=省内城市, 3=市内区县 */
@@ -23,12 +41,10 @@ export interface DrillState {
 export interface DataPoint {
     /** 区域名称 */
     name: string;
-    /** 度量值 */
+    /** 度量值（驱动颜色填充） */
     value: number;
     /** Power BI 选择标识（用于交互） */
     selectionId?: powerbi.visuals.ISelectionId;
-    /** 原始数据行索引 */
-    identity?: powerbi.visuals.ISelectionId;
     /** 工具提示字段 */
     tooltips?: Array<{ displayName: string; value: string }>;
 }
@@ -39,11 +55,31 @@ export class MapDataService {
     /** 全国地图行政区划代码 */
     static readonly CHINA_ADCODE = "100000";
 
-    /** DataV GeoAtlas API 基础 URL */
+    /** DataV GeoAtlas API 基础 URL（回退用） */
     static readonly GEO_API_BASE = "https://geo.datav.aliyun.com/areas_v3/bound";
 
+    /** 打包的本地 GeoJSON 数据注册表 */
+    private static readonly BUNDLED_GEO: { [adcode: string]: any } = {
+        "100000": chinaGeo,
+        "440000": guangdongGeo,
+        "330000": zhejiangGeo,
+        "320000": jiangsuGeo,
+        "110000": beijingGeo,
+        "310000": shanghaiGeo,
+        "510000": sichuanGeo,
+        "420000": hubeiGeo,
+        "370000": shandongGeo,
+        "430000": hunanGeo,
+        "350000": fujianGeo,
+        "410000": henanGeo,
+        "610000": shaanxiGeo,
+    };
+
     constructor() {
-        // 无需额外初始化
+        // 将打包数据预加载到缓存
+        Object.keys(MapDataService.BUNDLED_GEO).forEach((adcode) => {
+            this.cache.set(adcode, MapDataService.BUNDLED_GEO[adcode]);
+        });
     }
 
     /**
@@ -198,13 +234,44 @@ export class MapDataService {
     }
 
     /**
-     * 使用 fetch API 获取 JSON 数据
+     * 使用 fetch API 获取 JSON 数据（带 XMLHttpRequest 回退）
+     * Power BI Service 沙箱中 fetch 可能被 CSP 拦截，需要 XHR 兜底
      */
     private async fetchJSON(url: string): Promise<any> {
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        // 优先使用 fetch
+        if (typeof fetch === "function") {
+            try {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                return await response.json();
+            } catch (fetchErr) {
+                console.warn("[MapData] fetch 失败，尝试 XHR 回退:", fetchErr.message);
+            }
         }
-        return response.json();
+
+        // 回退到 XMLHttpRequest
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("GET", url, true);
+            xhr.setRequestHeader("Accept", "application/json");
+            xhr.onreadystatechange = () => {
+                if (xhr.readyState !== 4) return;
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try {
+                        resolve(JSON.parse(xhr.responseText));
+                    } catch (e) {
+                        reject(new Error(`JSON 解析失败: ${e.message}`));
+                    }
+                } else {
+                    reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}`));
+                }
+            };
+            xhr.onerror = () => reject(new Error("网络请求失败"));
+            xhr.ontimeout = () => reject(new Error("请求超时"));
+            xhr.timeout = 30000;
+            xhr.send();
+        });
     }
 }
