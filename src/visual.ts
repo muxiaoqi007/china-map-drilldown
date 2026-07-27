@@ -62,6 +62,8 @@ export class Visual implements IVisual {
     private previousDataKey: string = "";
     private lastRenderedLevel: number = 0;
     private lastUpdateOptions: VisualUpdateOptions | null = null;
+    /** 底层数据指纹：仅在数据真正变化时重绘，避免 Power BI 重复发送全量数据覆盖内部下钻状态 */
+    private dataFingerprint: string = "";
 
     private rawCatColumns: DataViewCategoryColumn[] = [];
     private rawCatNames: string[][] = [];
@@ -126,6 +128,14 @@ export class Visual implements IVisual {
                 this.showOverlay("请将省份字段拖入数据角色以开始");
                 return;
             }
+
+            // 数据指纹：底层数据未变化时跳过重绘，保住内部下钻状态
+            // （Power BI 在内部下钻后会重复发送全量数据，若不跳过会把省级地图重置回全国）
+            const fingerprint = `${this.rawCatNames.map((c) => c.length).join(",")}|${this.rawMeasureValues.length}|${parsedData.level}|${parsedData.dataPoints.length}`;
+            if (fingerprint === this.dataFingerprint && this.lastRenderedLevel >= 2) {
+                return;
+            }
+            this.dataFingerprint = fingerprint;
 
             const dataKey = `${parsedData.level}|${parsedData.dataPoints.length}|${parsedData.parentName}`;
             if (dataKey !== this.previousDataKey) {
@@ -693,8 +703,7 @@ export class Visual implements IVisual {
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
         await this.loadAndRenderDrillMap(adcode, provinceName, 2, cityDataPoints, minVal, maxVal);
-        // 联动：按省份交叉筛选其他视觉对象（如右侧表格）
-        this.selectByProvince(normProvince);
+        // 下钻优先：省份级不联动表格（避免表格被过滤成单行），仅地图内部下钻
     }
 
     /**
@@ -732,24 +741,7 @@ export class Visual implements IVisual {
         // 直辖市无地级层，面包屑的"省份"层即该直辖市本身
         this.level2ParentName = provinceName;
         await this.loadAndRenderDrillMap(adcode, provinceName, 3, districtDataPoints, minVal, maxVal);
-        // 联动：按省份（直辖市）交叉筛选其他视觉对象
-        this.selectByProvince(normProvince);
-    }
-
-    /**
-     * 按省份触发交叉筛选（用于下钻时联动其他视觉对象，如表格）
-     * 选取该省份的一个数据行 identity，Power BI 会按省份过滤其他视觉
-     */
-    private selectByProvince(normProvince: string): void {
-        const provinceNames = this.rawCatNames[0];
-        for (let i = 0; i < provinceNames.length; i++) {
-            if (MapDataService.normalizeRegionName(provinceNames[i]) === normProvince) {
-                const sid = this.host.createSelectionIdBuilder()
-                    .withCategory(this.rawCatColumns[0], i).createSelectionId();
-                this.selectionManager.select(sid, false);
-                return;
-            }
-        }
+        // 下钻优先：不联动表格，仅地图内部下钻
     }
 
     private async drillDownToCity(cityName: string): Promise<void> {
@@ -903,6 +895,7 @@ export class Visual implements IVisual {
         this.currentMapName = fmtNow.southChinaSeaMode === "inset" ? "china_no_scs" : "china";
         this.lastRenderedLevel = 1;
         this.previousDataKey = "";
+        this.dataFingerprint = "";
         this.selectionManager.clear();
         this.breadcrumbElement.style.display = "none";
         const data = this.level1DataPoints.length > 0 ? this.level1DataPoints : this.currentDataPoints;
