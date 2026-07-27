@@ -703,7 +703,8 @@ export class Visual implements IVisual {
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
         await this.loadAndRenderDrillMap(adcode, provinceName, 2, cityDataPoints, minVal, maxVal);
-        // 下钻优先：省份级不联动表格（避免表格被过滤成单行），仅地图内部下钻
+        // 联动表格：多选该省全部数据行，使表格过滤到整个省（数据指纹守卫保证地图不受影响）
+        this.selectProvinceMulti(normProvince);
     }
 
     /**
@@ -741,7 +742,8 @@ export class Visual implements IVisual {
         // 直辖市无地级层，面包屑的"省份"层即该直辖市本身
         this.level2ParentName = provinceName;
         await this.loadAndRenderDrillMap(adcode, provinceName, 3, districtDataPoints, minVal, maxVal);
-        // 下钻优先：不联动表格，仅地图内部下钻
+        // 联动表格：多选该直辖市全部数据行
+        this.selectProvinceMulti(normProvince);
     }
 
     private async drillDownToCity(cityName: string): Promise<void> {
@@ -775,6 +777,8 @@ export class Visual implements IVisual {
         if (!adcode) adcode = await this.resolveAdcode(cityName);
         if (!adcode) { this.crossFilter(cityName); return; }
         await this.loadAndRenderDrillMap(adcode, cityName, 3, districtDataPoints, minVal, maxVal);
+        // 联动表格：多选该市全部数据行，使表格过滤到整个市
+        this.selectCityMulti(cityName);
     }
 
     private crossFilter(name: string): void {
@@ -782,6 +786,33 @@ export class Visual implements IVisual {
             (d) => d.name === name || MapDataService.normalizeRegionName(d.name) === MapDataService.normalizeRegionName(name)
         );
         if (dp?.selectionId) this.selectionManager.select(dp.selectionId);
+    }
+
+    /** 多选该省全部数据行 → 表格等其他视觉过滤到整个省（而非单行） */
+    private selectProvinceMulti(normProvince: string): void {
+        if (this.rawCatNames.length < 1) return;
+        const provinceNames = this.rawCatNames[0];
+        const ids: powerbi.visuals.ISelectionId[] = [];
+        for (let i = 0; i < provinceNames.length; i++) {
+            if (MapDataService.normalizeRegionName(provinceNames[i]) !== normProvince) continue;
+            ids.push(this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[0], i).createSelectionId());
+        }
+        if (ids.length > 0) this.selectionManager.select(ids, false);
+    }
+
+    /** 多选该市全部数据行 → 表格等其他视觉过滤到整个市 */
+    private selectCityMulti(cityName: string): void {
+        if (this.rawCatNames.length < 2) return;
+        const cityNames = this.rawCatNames[1];
+        const normCity = MapDataService.normalizeRegionName(cityName);
+        const ids: powerbi.visuals.ISelectionId[] = [];
+        for (let i = 0; i < cityNames.length; i++) {
+            if (MapDataService.normalizeRegionName(cityNames[i]) !== normCity) continue;
+            const builder = this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[0], i);
+            if (this.rawCatColumns[1]) builder.withCategory(this.rawCatColumns[1], i);
+            ids.push(builder.createSelectionId());
+        }
+        if (ids.length > 0) this.selectionManager.select(ids, false);
     }
 
     private async resolveAdcode(regionName: string): Promise<string | null> {
@@ -917,7 +948,7 @@ export class Visual implements IVisual {
         this.currentMapName = `map_${adcode}`;
         this.lastRenderedLevel = 2;
         this.previousDataKey = `2|${this.level2DataPoints.length}|${provinceName}`;
-        this.selectionManager.clear();
+        this.selectProvinceMulti(MapDataService.normalizeRegionName(provinceName));
         const state = this.buildRestoreState(2, provinceName, this.level2DataPoints);
         this.chart.clear();
         this.chart.setOption(this.buildEChartsOption(state), true);
