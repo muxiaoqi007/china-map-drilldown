@@ -426,6 +426,7 @@ export class Visual implements IVisual {
         this.hideOverlay();
 
         const option = this.buildEChartsOption(drillState);
+        this.chart.clear();
         this.chart.setOption(option, true);
         this.bindChartEvents();
         this.updateBreadcrumb(drillState);
@@ -507,7 +508,9 @@ export class Visual implements IVisual {
         if (fmt.southChinaSeaMode === "inset" && state.level <= 1) {
             this.addSouthChinaSeaInset(option);
         } else {
+            // 完整显示模式：显式清空小图组件和图形元素，避免残留
             option.geo = null;
+            option.graphic = [];
         }
 
         return option;
@@ -565,27 +568,62 @@ export class Visual implements IVisual {
 
     private buildMapData(dataPoints: DataPoint[]): Array<{ name: string; value: number; _index: number }> {
         const nameMap = new Map<string, { value: number; index: number }>();
+        const shortMap = new Map<string, { value: number; index: number }>();
+        const coreEntries: Array<{ core: string; value: number; index: number }> = [];
+
         dataPoints.forEach((dp, idx) => {
-            nameMap.set(dp.name, { value: dp.value, index: idx });
-            const suffixes = ["省", "市", "自治区", "特别行政区", "壮族自治区", "回族自治区", "维吾尔自治区"];
+            const clean = dp.name.trim();
+            const entry = { value: dp.value, index: idx };
+            // 精确（含 trim）
+            if (!nameMap.has(clean)) nameMap.set(clean, entry);
+            // 加后缀变体
+            const suffixes = ["省", "市", "自治区", "特别行政区", "壮族自治区", "回族自治区", "维吾尔自治区", "自治州", "地区"];
             for (const suffix of suffixes) {
-                if (!dp.name.endsWith(suffix)) nameMap.set(dp.name + suffix, { value: dp.value, index: idx });
+                if (!clean.endsWith(suffix) && !nameMap.has(clean + suffix)) nameMap.set(clean + suffix, entry);
             }
-            const shortName = MapDataService.normalizeRegionName(dp.name);
-            if (shortName !== dp.name) nameMap.set(shortName, { value: dp.value, index: idx });
+            // 标准化短名
+            const shortName = MapDataService.normalizeRegionName(clean);
+            if (shortName && !shortMap.has(shortName)) shortMap.set(shortName, entry);
+            // 前缀匹配用的核心名（取标准化短名，去掉常见后缀）
+            const core = shortName.replace(/(地区|新区|城区|郊区)$/g, "") || shortName;
+            coreEntries.push({ core, value: dp.value, index: idx });
         });
 
         const result: Array<{ name: string; value: number; _index: number }> = [];
+        const unmatchedFeatures: string[] = [];
         const mapGeo = (echarts as any).getMap(this.currentMapName);
         const features = mapGeo?.geoJSON?.features || [];
+
         for (const feature of features) {
-            const geoName: string = feature.properties?.name || "";
+            const geoName: string = (feature.properties?.name || "").trim();
+            if (!geoName) continue;
             let matched = nameMap.get(geoName);
-            if (!matched) matched = nameMap.get(MapDataService.normalizeRegionName(geoName));
-            if (matched) result.push({ name: geoName, value: matched.value, _index: matched.index });
+            if (!matched) matched = shortMap.get(MapDataService.normalizeRegionName(geoName));
+            // 前缀兜底：数据核心名与 GeoJSON 短名互为前缀
+            if (!matched) {
+                const geoShort = MapDataService.normalizeRegionName(geoName);
+                let best: { value: number; index: number } | null = null;
+                let bestLen = 1;
+                for (const e of coreEntries) {
+                    if (e.core.length < 2) continue;
+                    if (geoShort.startsWith(e.core) || e.core.startsWith(geoShort)) {
+                        if (e.core.length > bestLen) { bestLen = e.core.length; best = { value: e.value, index: e.index }; }
+                    }
+                }
+                if (best) matched = best;
+            }
+            if (matched) {
+                result.push({ name: geoName, value: matched.value, _index: matched.index });
+            } else {
+                unmatchedFeatures.push(geoName);
+            }
+        }
+
+        if (unmatchedFeatures.length > 0) {
+            console.warn("[ChinaMap] 未匹配的区域:", unmatchedFeatures.join(", "));
         }
         if (result.length === 0) {
-            return dataPoints.map((dp, idx) => ({ name: dp.name, value: dp.value, _index: idx }));
+            return dataPoints.map((dp, idx) => ({ name: dp.name.trim(), value: dp.value, _index: idx }));
         }
         return result;
     }
@@ -616,6 +654,21 @@ export class Visual implements IVisual {
         const cityNames = this.rawCatNames[1];
         const values = this.rawMeasureValues;
 
+        // ── 直辖市检测：省份名==城市名（北京/天津/上海/重庆），无地级层，直接下钻到区县 ──
+        const normProvince = MapDataService.normalizeRegionName(provinceName);
+        let isMunicipality = true;
+        for (let i = 0; i < provinceNames.length; i++) {
+            if (MapDataService.normalizeRegionName(provinceNames[i]) !== normProvince) continue;
+            if (MapDataService.normalizeRegionName(cityNames[i]) !== normProvince) {
+                isMunicipality = false;
+                break;
+            }
+        }
+        if (isMunicipality && this.rawCatNames.length >= 3) {
+            await this.drillDownMunicipalityToDistrict(provinceName, normProvince);
+            return;
+        }
+
         const cityAgg = new Map<string, { total: number; firstIdx: number }>();
         for (let i = 0; i < provinceNames.length; i++) {
             if (provinceNames[i] !== provinceName
@@ -640,6 +693,63 @@ export class Visual implements IVisual {
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
         await this.loadAndRenderDrillMap(adcode, provinceName, 2, cityDataPoints, minVal, maxVal);
+        // 联动：按省份交叉筛选其他视觉对象（如右侧表格）
+        this.selectByProvince(normProvince);
+    }
+
+    /**
+     * 直辖市下钻：省==市，直接聚合区县列并渲染区县级地图（level 3）
+     * 地图使用该直辖市的省级 adcode（如北京 110000），其 features 即各区
+     */
+    private async drillDownMunicipalityToDistrict(provinceName: string, normProvince: string): Promise<void> {
+        if (!this.chart) return;
+        const provinceNames = this.rawCatNames[0];
+        const districtNames = this.rawCatNames[2];
+        const values = this.rawMeasureValues;
+
+        const districtAgg = new Map<string, { total: number; firstIdx: number }>();
+        for (let i = 0; i < provinceNames.length; i++) {
+            if (MapDataService.normalizeRegionName(provinceNames[i]) !== normProvince) continue;
+            const district = districtNames[i];
+            const existing = districtAgg.get(district);
+            if (existing) { existing.total += (values[i] ?? 0); }
+            else { districtAgg.set(district, { total: values[i] ?? 0, firstIdx: i }); }
+        }
+        if (districtAgg.size === 0) return;
+
+        const districtDataPoints: DataPoint[] = [];
+        let minVal = Infinity, maxVal = -Infinity;
+        districtAgg.forEach((info, name) => {
+            const sid = this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[2], info.firstIdx).createSelectionId();
+            districtDataPoints.push({ name, value: info.total, selectionId: sid });
+            minVal = Math.min(minVal, info.total);
+            maxVal = Math.max(maxVal, info.total);
+        });
+        if (minVal === maxVal && districtDataPoints.length > 1) { minVal = maxVal > 0 ? 0 : maxVal - 1; maxVal = maxVal > 0 ? maxVal * 1.1 : 1; }
+
+        const adcode = await this.resolveAdcode(provinceName);
+        if (!adcode) return;
+        // 直辖市无地级层，面包屑的"省份"层即该直辖市本身
+        this.level2ParentName = provinceName;
+        await this.loadAndRenderDrillMap(adcode, provinceName, 3, districtDataPoints, minVal, maxVal);
+        // 联动：按省份（直辖市）交叉筛选其他视觉对象
+        this.selectByProvince(normProvince);
+    }
+
+    /**
+     * 按省份触发交叉筛选（用于下钻时联动其他视觉对象，如表格）
+     * 选取该省份的一个数据行 identity，Power BI 会按省份过滤其他视觉
+     */
+    private selectByProvince(normProvince: string): void {
+        const provinceNames = this.rawCatNames[0];
+        for (let i = 0; i < provinceNames.length; i++) {
+            if (MapDataService.normalizeRegionName(provinceNames[i]) === normProvince) {
+                const sid = this.host.createSelectionIdBuilder()
+                    .withCategory(this.rawCatColumns[0], i).createSelectionId();
+                this.selectionManager.select(sid, false);
+                return;
+            }
+        }
     }
 
     private async drillDownToCity(cityName: string): Promise<void> {
@@ -722,6 +832,7 @@ export class Visual implements IVisual {
             if (level === 2) { this.level2DataPoints = dataPoints; this.level2ParentName = parentName; }
 
             const option = this.buildEChartsOption(drillState);
+            this.chart.clear();
             this.chart.setOption(option, true);
             this.bindChartEvents();
             this.updateBreadcrumb(drillState);
@@ -797,6 +908,7 @@ export class Visual implements IVisual {
         const data = this.level1DataPoints.length > 0 ? this.level1DataPoints : this.currentDataPoints;
         if (data.length > 0) {
             const state = this.buildRestoreState(1, "", data);
+            this.chart.clear();
             this.chart.setOption(this.buildEChartsOption(state), true);
             this.bindChartEvents();
         }
@@ -814,6 +926,7 @@ export class Visual implements IVisual {
         this.previousDataKey = `2|${this.level2DataPoints.length}|${provinceName}`;
         this.selectionManager.clear();
         const state = this.buildRestoreState(2, provinceName, this.level2DataPoints);
+        this.chart.clear();
         this.chart.setOption(this.buildEChartsOption(state), true);
         this.bindChartEvents();
         this.updateBreadcrumb(state);

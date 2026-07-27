@@ -20,6 +20,28 @@ const hunanGeo = require("./assets/hunan.json");
 const fujianGeo = require("./assets/fujian.json");
 const henanGeo = require("./assets/henan.json");
 const shaanxiGeo = require("./assets/shaanxi.json");
+// 其余省级行政区（按 adcode 命名）
+const tianjinGeo = require("./assets/120000.json");
+const hebeiGeo = require("./assets/130000.json");
+const shanxiGeo = require("./assets/140000.json");
+const neimengguGeo = require("./assets/150000.json");
+const liaoningGeo = require("./assets/210000.json");
+const jilinGeo = require("./assets/220000.json");
+const heilongjiangGeo = require("./assets/230000.json");
+const anhuiGeo = require("./assets/340000.json");
+const jiangxiGeo = require("./assets/360000.json");
+const guangxiGeo = require("./assets/450000.json");
+const hainanGeo = require("./assets/460000.json");
+const chongqingGeo = require("./assets/500000.json");
+const guizhouGeo = require("./assets/520000.json");
+const yunnanGeo = require("./assets/530000.json");
+const xizangGeo = require("./assets/540000.json");
+const gansuGeo = require("./assets/620000.json");
+const qinghaiGeo = require("./assets/630000.json");
+const ningxiaGeo = require("./assets/640000.json");
+const xinjiangGeo = require("./assets/650000.json");
+const hongkongGeo = require("./assets/810000.json");
+const macaoGeo = require("./assets/820000.json");
 
 export interface DrillState {
     /** 当前层级：1=全国, 2=省内城市, 3=市内区县 */
@@ -58,21 +80,42 @@ export class MapDataService {
     /** DataV GeoAtlas API 基础 URL（回退用） */
     static readonly GEO_API_BASE = "https://geo.datav.aliyun.com/areas_v3/bound";
 
-    /** 打包的本地 GeoJSON 数据注册表 */
+    /** 打包的本地 GeoJSON 数据注册表（全国 + 33 个省级行政区） */
     private static readonly BUNDLED_GEO: { [adcode: string]: any } = {
         "100000": chinaGeo,
-        "440000": guangdongGeo,
-        "330000": zhejiangGeo,
-        "320000": jiangsuGeo,
         "110000": beijingGeo,
+        "120000": tianjinGeo,
+        "130000": hebeiGeo,
+        "140000": shanxiGeo,
+        "150000": neimengguGeo,
+        "210000": liaoningGeo,
+        "220000": jilinGeo,
+        "230000": heilongjiangGeo,
         "310000": shanghaiGeo,
-        "510000": sichuanGeo,
-        "420000": hubeiGeo,
-        "370000": shandongGeo,
-        "430000": hunanGeo,
+        "320000": jiangsuGeo,
+        "330000": zhejiangGeo,
+        "340000": anhuiGeo,
         "350000": fujianGeo,
+        "360000": jiangxiGeo,
+        "370000": shandongGeo,
         "410000": henanGeo,
+        "420000": hubeiGeo,
+        "430000": hunanGeo,
+        "440000": guangdongGeo,
+        "450000": guangxiGeo,
+        "460000": hainanGeo,
+        "500000": chongqingGeo,
+        "510000": sichuanGeo,
+        "520000": guizhouGeo,
+        "530000": yunnanGeo,
+        "540000": xizangGeo,
         "610000": shaanxiGeo,
+        "620000": gansuGeo,
+        "630000": qinghaiGeo,
+        "640000": ningxiaGeo,
+        "650000": xinjiangGeo,
+        "810000": hongkongGeo,
+        "820000": macaoGeo,
     };
 
     constructor() {
