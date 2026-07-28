@@ -59,6 +59,12 @@ export class Visual implements IVisual {
     private level1DataPoints: DataPoint[] = [];
     private level2DataPoints: DataPoint[] = [];
     private level2ParentName: string = "";
+    /** 当前下钻的父级名称（level 2=省名, level 3=市名），用于恢复联动 */
+    private currentDrillParentName: string = "";
+    /** 当前下钻所属的省份名（level 2/3 均有效），用于面包屑省份层级回退 */
+    private currentDrillProvinceName: string = "";
+    /** 当前 level 3 下钻是否为直辖市（恢复联动时用省级多选） */
+    private currentDrillIsMunicipality: boolean = false;
     private previousDataKey: string = "";
     private lastRenderedLevel: number = 0;
     private lastUpdateOptions: VisualUpdateOptions | null = null;
@@ -651,11 +657,37 @@ export class Visual implements IVisual {
                 if (params.name) this.drillDownToCity(params.name);
             } else {
                 if (dpIndex != null && dpIndex < this.currentDataPoints.length) {
-                    const dp = this.currentDataPoints[dpIndex];
-                    if (dp.selectionId) this.selectionManager.select(dp.selectionId);
+                    this.handleDistrictClick(this.currentDataPoints[dpIndex]);
                 }
             }
         });
+    }
+
+    /**
+     * 区县（叶子）层点击：选中该区联动表格；若点击导致取消选中（selection 变空），
+     * 自动恢复整市多选，避免表格失去过滤上下文。
+     */
+    private async handleDistrictClick(dp: DataPoint): Promise<void> {
+        if (!dp.selectionId) return;
+        await this.selectionManager.select(dp.selectionId);
+        if (this.selectionManager.getSelectionIds().length === 0) {
+            this.restoreCurrentLevelLinkage();
+        }
+    }
+
+    /** 按当前下钻层级重新应用对应的整区域多选（恢复表格联动） */
+    private restoreCurrentLevelLinkage(): void {
+        if (this.lastRenderedLevel === 3 && this.currentDrillParentName) {
+            if (this.currentDrillIsMunicipality) {
+                this.selectProvinceMulti(MapDataService.normalizeRegionName(this.currentDrillParentName));
+            } else {
+                this.selectCityMulti(this.currentDrillParentName);
+            }
+            return;
+        }
+        if (this.level2ParentName) {
+            this.selectProvinceMulti(MapDataService.normalizeRegionName(this.level2ParentName));
+        }
     }
 
     private async drillDownToProvince(provinceName: string): Promise<void> {
@@ -702,6 +734,7 @@ export class Visual implements IVisual {
 
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
+        this.currentDrillProvinceName = provinceName;
         await this.loadAndRenderDrillMap(adcode, provinceName, 2, cityDataPoints, minVal, maxVal);
         // 联动表格：多选该省全部数据行，使表格过滤到整个省（数据指纹守卫保证地图不受影响）
         this.selectProvinceMulti(normProvince);
@@ -741,6 +774,8 @@ export class Visual implements IVisual {
         if (!adcode) return;
         // 直辖市无地级层，面包屑的"省份"层即该直辖市本身
         this.level2ParentName = provinceName;
+        this.currentDrillProvinceName = provinceName;
+        this.currentDrillIsMunicipality = true;
         await this.loadAndRenderDrillMap(adcode, provinceName, 3, districtDataPoints, minVal, maxVal);
         // 联动表格：多选该直辖市全部数据行
         this.selectProvinceMulti(normProvince);
@@ -776,6 +811,8 @@ export class Visual implements IVisual {
         let adcode = this.findRegionAdcodeFromMap(cityName, this.currentMapName);
         if (!adcode) adcode = await this.resolveAdcode(cityName);
         if (!adcode) { this.crossFilter(cityName); return; }
+        this.currentDrillIsMunicipality = false;
+        this.currentDrillProvinceName = this.findProvinceOfCity(cityName) || this.currentDrillProvinceName;
         await this.loadAndRenderDrillMap(adcode, cityName, 3, districtDataPoints, minVal, maxVal);
         // 联动表格：多选该市全部数据行，使表格过滤到整个市
         this.selectCityMulti(cityName);
@@ -815,6 +852,20 @@ export class Visual implements IVisual {
         if (ids.length > 0) this.selectionManager.select(ids, false);
     }
 
+    /** 从缓存分类列中查找某城市所属的省份名 */
+    private findProvinceOfCity(cityName: string): string | null {
+        if (this.rawCatNames.length < 2) return null;
+        const provinceNames = this.rawCatNames[0];
+        const cityNames = this.rawCatNames[1];
+        const normCity = MapDataService.normalizeRegionName(cityName);
+        for (let i = 0; i < cityNames.length; i++) {
+            if (MapDataService.normalizeRegionName(cityNames[i]) === normCity) {
+                return provinceNames[i];
+            }
+        }
+        return null;
+    }
+
     private async resolveAdcode(regionName: string): Promise<string | null> {
         let adcode = this.findRegionAdcodeFromMap(regionName, this.currentMapName);
         if (adcode) return adcode;
@@ -852,6 +903,7 @@ export class Visual implements IVisual {
             this.currentDataPoints = dataPoints;
             this.lastRenderedLevel = level;
             this.previousDataKey = `${level}|${dataPoints.length}|${parentName}`;
+            this.currentDrillParentName = parentName;
             if (level === 2) { this.level2DataPoints = dataPoints; this.level2ParentName = parentName; }
 
             const option = this.buildEChartsOption(drillState);
@@ -901,7 +953,7 @@ export class Visual implements IVisual {
         if (state.level === 3) {
             this.breadcrumbElement.appendChild(this.createSep());
             const prov = document.createElement("span");
-            prov.textContent = this.level2ParentName || "省份";
+            prov.textContent = this.currentDrillProvinceName || this.level2ParentName || "省份";
             prov.addEventListener("click", () => this.navigateToLevel2());
             this.breadcrumbElement.appendChild(prov);
             this.breadcrumbElement.appendChild(this.createSep());
@@ -939,14 +991,20 @@ export class Visual implements IVisual {
     }
 
     private navigateToLevel2(): void {
-        if (!this.chart || this.level2DataPoints.length === 0) return;
-        const provinceName = this.level2ParentName;
+        if (!this.chart) return;
+        // 直辖市无地级层，"省份"层即区县层，回退到全国
+        if (this.currentDrillIsMunicipality) { this.navigateToLevel1(); return; }
+
+        const provinceName = this.currentDrillProvinceName || this.level2ParentName;
+        if (!provinceName || this.level2DataPoints.length === 0) { this.navigateToLevel1(); return; }
+
         const adcode = this.findRegionAdcodeFromMap(provinceName, "china")
             || this.findRegionAdcodeFromMap(provinceName, this.currentMapName);
         if (!adcode) { this.navigateToLevel1(); return; }
         this.currentAdcode = adcode;
         this.currentMapName = `map_${adcode}`;
         this.lastRenderedLevel = 2;
+        this.currentDrillParentName = provinceName;
         this.previousDataKey = `2|${this.level2DataPoints.length}|${provinceName}`;
         this.selectProvinceMulti(MapDataService.normalizeRegionName(provinceName));
         const state = this.buildRestoreState(2, provinceName, this.level2DataPoints);
