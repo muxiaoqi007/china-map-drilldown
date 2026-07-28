@@ -19,6 +19,7 @@ import ISelectionManager = powerbi.extensibility.ISelectionManager;
 import IVisualHost = powerbi.extensibility.visual.IVisualHost;
 import DataView = powerbi.DataView;
 import DataViewCategoryColumn = powerbi.DataViewCategoryColumn;
+import DataViewTable = powerbi.DataViewTable;
 
 /** 格式化配置提取接口 */
 interface MapFormatConfig {
@@ -65,6 +66,8 @@ export class Visual implements IVisual {
     private currentDrillProvinceName: string = "";
     /** 当前 level 3 下钻是否为直辖市（恢复联动时用省级多选） */
     private currentDrillIsMunicipality: boolean = false;
+    /** 当前下钻省份的行政区划代码，面包屑回退时不再依赖全国地图是否已注册 */
+    private currentDrillProvinceAdcode: string = "";
     private previousDataKey: string = "";
     private lastRenderedLevel: number = 0;
     private lastUpdateOptions: VisualUpdateOptions | null = null;
@@ -74,6 +77,7 @@ export class Visual implements IVisual {
     private rawCatColumns: DataViewCategoryColumn[] = [];
     private rawCatNames: string[][] = [];
     private rawMeasureValues: number[] = [];
+    private rawTable: DataViewTable | null = null;
 
     private tooltipColumns: Array<{ displayName: string; values: string[] }> = [];
     private scsInsetFeatures: any[] = [];
@@ -175,6 +179,11 @@ export class Visual implements IVisual {
     /* ═══ 数据解析 ═══ */
 
     private parseDataView(dataView: DataView): DrillState | null {
+        if (dataView.table?.rows?.length) {
+            return this.parseTableData(dataView.table);
+        }
+
+        this.rawTable = null;
         const categorical = dataView.categorical;
         if (!categorical?.categories?.length || !categorical.values?.length) return null;
 
@@ -201,7 +210,7 @@ export class Visual implements IVisual {
         }
 
         // 提取度量值 (values[0])
-        const flatValues = this.extractValues(values[0], rowCount);
+        const flatValues = this.extractValues(values[0], rowCount, primaryCat);
         if (!flatValues) return null;
         this.rawMeasureValues = flatValues.slice();
 
@@ -271,40 +280,205 @@ export class Visual implements IVisual {
         return this.buildDrillState(1, "", primaryCat, flatValues, ttData);
     }
 
-    private extractValues(valCol: any, rowCount: number): number[] | null {
+    /**
+     * 表格映射按原始行返回省/市/区/度量，列之间天然对齐。
+     * 这避免多分类 categorical 映射把度量拆成独立分组后产生缺失或错配。
+     */
+    private parseTableData(table: DataViewTable): DrillState | null {
+        const rows = table.rows || [];
+        const columns = table.columns || [];
+        const roleIndex = (role: string): number =>
+            columns.findIndex((column) => !!column.roles?.[role]);
+
+        const provinceIndex = roleIndex("province");
+        const cityIndex = roleIndex("city");
+        const districtIndex = roleIndex("district");
+        const measureIndex = roleIndex("measure");
+        if (provinceIndex < 0 || measureIndex < 0 || rows.length === 0) return null;
+
+        this.rawTable = table;
+        this.rawCatColumns = [];
+        const provinceNames = rows.map((row) => String(row[provinceIndex] ?? ""));
+        const cityNames = cityIndex >= 0 ? rows.map((row) => String(row[cityIndex] ?? "")) : [];
+        const districtNames = districtIndex >= 0 ? rows.map((row) => String(row[districtIndex] ?? "")) : [];
+        this.rawCatNames = [provinceNames];
+        if (cityIndex >= 0) this.rawCatNames.push(cityNames);
+        if (districtIndex >= 0) this.rawCatNames.push(districtNames);
+        this.rawMeasureValues = rows.map((row) => Number(row[measureIndex] ?? 0));
+
+        this.tooltipColumns = [];
+        for (let ci = 0; ci < columns.length; ci++) {
+            if (!columns[ci].roles?.tooltips) continue;
+            this.tooltipColumns.push({
+                displayName: columns[ci].displayName || "",
+                values: rows.map((row) => String(row[ci] ?? ""))
+            });
+        }
+
+        const normalizeSet = (names: string[]): Set<string> =>
+            new Set(names.map((name) => MapDataService.normalizeRegionName(name)));
+        const uniqueProvinceCount = normalizeSet(provinceNames).size;
+
+        if (districtIndex >= 0 && uniqueProvinceCount === 1 && cityNames.length > 0) {
+            const uniqueCityCount = normalizeSet(cityNames).size;
+            if (uniqueCityCount === 1) {
+                return this.buildTableDrillState(3, cityNames[0], districtNames);
+            }
+        }
+        if (cityIndex >= 0 && uniqueProvinceCount === 1) {
+            return this.buildTableDrillState(2, provinceNames[0], cityNames);
+        }
+        return this.buildTableDrillState(1, "", provinceNames);
+    }
+
+    private buildTableDrillState(level: number, parentName: string, names: string[]): DrillState {
+        const grouped = new Map<string, { name: string; total: number; firstIdx: number }>();
+        for (let i = 0; i < names.length; i++) {
+            const normalized = MapDataService.normalizeRegionName(names[i]);
+            const key = normalized || names[i];
+            const existing = grouped.get(key);
+            if (existing) {
+                existing.total += this.rawMeasureValues[i] ?? 0;
+            } else {
+                grouped.set(key, {
+                    name: names[i],
+                    total: this.rawMeasureValues[i] ?? 0,
+                    firstIdx: i
+                });
+            }
+        }
+
+        const dataPoints: DataPoint[] = [];
+        let minValue = Infinity;
+        let maxValue = -Infinity;
+        grouped.forEach((item) => {
+            const dp: DataPoint = {
+                name: item.name,
+                value: item.total,
+                selectionId: this.createRowSelectionId(item.firstIdx, Math.max(0, level - 1))
+            };
+            const tooltips = this.buildTooltipData([item.firstIdx])[0];
+            if (tooltips?.length) dp.tooltips = tooltips;
+            dataPoints.push(dp);
+            minValue = Math.min(minValue, item.total);
+            maxValue = Math.max(maxValue, item.total);
+        });
+
+        if (minValue === maxValue && dataPoints.length > 1) {
+            minValue = maxValue > 0 ? 0 : maxValue - 1;
+            maxValue = maxValue > 0 ? maxValue * 1.1 : 1;
+        }
+        return {
+            level,
+            parentName,
+            parentAdcode: MapDataService.CHINA_ADCODE,
+            mapName: this.getMapName(level, parentName),
+            dataPoints,
+            minValue,
+            maxValue
+        };
+    }
+
+    private extractValues(valCol: any, rowCount: number, primaryCat?: DataViewCategoryColumn): number[] | null {
         if (!valCol) return null;
-        if (valCol.source && valCol.values) {
+
+        // 平坦模式：values 直接对应分类行
+        if (valCol.source && Array.isArray(valCol.values)) {
             const rawVals = valCol.values;
+            const idxMap = valCol.identityFrom?.map;
+            if (Array.isArray(idxMap) && idxMap.length > 0) {
+                const mappedResult = new Array(rowCount).fill(0);
+                for (let i = 0; i < rawVals.length; i++) {
+                    const row = idxMap[i];
+                    if (typeof row === "number" && row >= 0 && row < rowCount) {
+                        mappedResult[row] += Number(rawVals[i] ?? 0);
+                    }
+                }
+                return mappedResult;
+            }
+
             const result: number[] = [];
             for (let i = 0; i < rawVals.length; i++) {
                 result.push(Number(rawVals[i] ?? 0));
             }
             return result;
         }
-        // 分组模式
+
+        // 分组模式：按分组的 identity 归并到对应的省份行
         const flatValues = new Array(rowCount).fill(0);
-        if (valCol.identityFrom?.map) {
-            const idxMap: number[] = valCol.identityFrom.map;
-            const innerVals = valCol.values?.[0]?.values || valCol.values;
-            if (Array.isArray(innerVals)) {
-                for (let j = 0; j < innerVals.length; j++) {
-                    const idx = idxMap[j];
-                    if (idx != null && idx < rowCount) {
-                        flatValues[idx] += Number(innerVals[j] ?? 0);
-                    }
-                }
-            }
-        } else if (Array.isArray(valCol.values)) {
-            for (const inner of valCol.values) {
-                const iv = inner?.values;
-                if (Array.isArray(iv)) {
-                    for (let i = 0; i < Math.min(iv.length, rowCount); i++) {
-                        flatValues[i] += Number(iv[i] ?? 0);
-                    }
-                }
+
+        // 构建省份行 identity → 行索引 的映射
+        const identityToRow = new Map<string, number>();
+        const nameToRow = new Map<string, number>();
+        if (primaryCat?.identity) {
+            for (let i = 0; i < primaryCat.identity.length; i++) {
+                const key = this.serializeIdentity(primaryCat.identity[i]);
+                if (key && !identityToRow.has(key)) identityToRow.set(key, i);
             }
         }
+        if (primaryCat?.values) {
+            for (let i = 0; i < primaryCat.values.length; i++) {
+                const name = MapDataService.normalizeRegionName(String(primaryCat.values[i] ?? ""));
+                if (name && !nameToRow.has(name)) nameToRow.set(name, i);
+            }
+        }
+
+        const sumGroup = (g: any): number => {
+            let s = 0;
+            const inner = Array.isArray(g?.values) ? g.values : [];
+            for (const m of inner) {
+                const arr = Array.isArray(m?.values) ? m.values : (Array.isArray(m) ? m : []);
+                for (const v of arr) s += Number(v ?? 0);
+            }
+            return s;
+        };
+
+        const groupToRow = (g: any, gi: number): number => {
+            // 1) Power BI 分组名（分组通常按度量值排序，不能依赖数组位置）
+            const groupName = MapDataService.normalizeRegionName(String(g?.name ?? ""));
+            const nameRow = groupName ? nameToRow.get(groupName) : undefined;
+            if (nameRow != null) return nameRow;
+            // 2) 分组自身 identity
+            const gKey = this.serializeIdentity(g?.identity);
+            const identityRow = gKey ? identityToRow.get(gKey) : undefined;
+            if (identityRow != null) return identityRow;
+            // 3) identityFrom.map[0]（部分宿主直接提供分类行索引）
+            const m0 = g?.identityFrom?.map?.[0];
+            if (typeof m0 === "number" && m0 >= 0 && m0 < rowCount) return m0;
+            // 4) 仅在缺少任何映射信息时按位置兜底
+            return gi < rowCount ? gi : -1;
+        };
+
+        const mappedValues = valCol.values?.[0]?.values;
+        const isMappedFlatValues = valCol.identityFrom?.map
+            && Array.isArray(mappedValues)
+            && mappedValues.every((v: any) => !v || typeof v !== "object" || !Array.isArray(v.values));
+        if (isMappedFlatValues) {
+            const idxMap: number[] = valCol.identityFrom.map;
+            for (let j = 0; j < mappedValues.length; j++) {
+                const idx = idxMap[j];
+                if (idx != null && idx < rowCount) flatValues[idx] += Number(mappedValues[j] ?? 0);
+            }
+        } else if (Array.isArray(valCol.values)) {
+            for (let gi = 0; gi < valCol.values.length; gi++) {
+                const g = valCol.values[gi];
+                const row = groupToRow(g, gi);
+                if (row >= 0 && row < rowCount) flatValues[row] += sumGroup(g);
+            }
+        }
+
         return flatValues;
+    }
+
+    /** 序列化 Power BI identity 用于匹配（无法 JSON 化时返回 null） */
+    private serializeIdentity(identity: any): string | null {
+        if (identity == null) return null;
+        try {
+            const s = JSON.stringify(identity);
+            return s && s !== "{}" ? s : String(identity);
+        } catch (e) {
+            return typeof identity === "object" ? null : String(identity);
+        }
     }
 
     private aggregateByCategory(
@@ -438,6 +612,8 @@ export class Visual implements IVisual {
         } else if (drillState.level === 2) {
             this.level2DataPoints = drillState.dataPoints;
             this.level2ParentName = drillState.parentName;
+            this.currentDrillProvinceName = drillState.parentName;
+            this.currentDrillProvinceAdcode = targetAdcode;
         }
         this.hideOverlay();
 
@@ -585,11 +761,14 @@ export class Visual implements IVisual {
     private buildMapData(dataPoints: DataPoint[]): Array<{ name: string; value: number; _index: number }> {
         const nameMap = new Map<string, { value: number; index: number }>();
         const shortMap = new Map<string, { value: number; index: number }>();
+        const provinceCodeMap = new Map<string, { value: number; index: number }>();
         const coreEntries: Array<{ core: string; value: number; index: number }> = [];
 
         dataPoints.forEach((dp, idx) => {
             const clean = dp.name.trim();
             const entry = { value: dp.value, index: idx };
+            const provinceAdcode = MapDataService.getProvinceAdcode(clean);
+            if (provinceAdcode) provinceCodeMap.set(provinceAdcode, entry);
             // 精确（含 trim）
             if (!nameMap.has(clean)) nameMap.set(clean, entry);
             // 加后缀变体
@@ -613,7 +792,11 @@ export class Visual implements IVisual {
         for (const feature of features) {
             const geoName: string = (feature.properties?.name || "").trim();
             if (!geoName) continue;
-            let matched = nameMap.get(geoName);
+            const geoAdcode = String(feature.properties?.adcode || feature.properties?.code || "");
+            let matched = this.currentAdcode === MapDataService.CHINA_ADCODE && geoAdcode
+                ? provinceCodeMap.get(geoAdcode)
+                : undefined;
+            if (!matched) matched = nameMap.get(geoName);
             if (!matched) matched = shortMap.get(MapDataService.normalizeRegionName(geoName));
             // 前缀兜底：数据核心名与 GeoJSON 短名互为前缀
             if (!matched) {
@@ -725,7 +908,7 @@ export class Visual implements IVisual {
         const cityDataPoints: DataPoint[] = [];
         let minVal = Infinity, maxVal = -Infinity;
         cityAgg.forEach((info, cityName) => {
-            const sid = this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[1], info.firstIdx).createSelectionId();
+            const sid = this.createRowSelectionId(info.firstIdx, 1);
             cityDataPoints.push({ name: cityName, value: info.total, selectionId: sid });
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
@@ -735,6 +918,7 @@ export class Visual implements IVisual {
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
         this.currentDrillProvinceName = provinceName;
+        this.currentDrillProvinceAdcode = adcode;
         await this.loadAndRenderDrillMap(adcode, provinceName, 2, cityDataPoints, minVal, maxVal);
         // 联动表格：多选该省全部数据行，使表格过滤到整个省（数据指纹守卫保证地图不受影响）
         this.selectProvinceMulti(normProvince);
@@ -763,7 +947,7 @@ export class Visual implements IVisual {
         const districtDataPoints: DataPoint[] = [];
         let minVal = Infinity, maxVal = -Infinity;
         districtAgg.forEach((info, name) => {
-            const sid = this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[2], info.firstIdx).createSelectionId();
+            const sid = this.createRowSelectionId(info.firstIdx, 2);
             districtDataPoints.push({ name, value: info.total, selectionId: sid });
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
@@ -775,6 +959,7 @@ export class Visual implements IVisual {
         // 直辖市无地级层，面包屑的"省份"层即该直辖市本身
         this.level2ParentName = provinceName;
         this.currentDrillProvinceName = provinceName;
+        this.currentDrillProvinceAdcode = adcode;
         this.currentDrillIsMunicipality = true;
         await this.loadAndRenderDrillMap(adcode, provinceName, 3, districtDataPoints, minVal, maxVal);
         // 联动表格：多选该直辖市全部数据行
@@ -801,7 +986,7 @@ export class Visual implements IVisual {
         const districtDataPoints: DataPoint[] = [];
         let minVal = Infinity, maxVal = -Infinity;
         districtAgg.forEach((info, name) => {
-            const sid = this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[2], info.firstIdx).createSelectionId();
+            const sid = this.createRowSelectionId(info.firstIdx, 2);
             districtDataPoints.push({ name, value: info.total, selectionId: sid });
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
@@ -832,7 +1017,8 @@ export class Visual implements IVisual {
         const ids: powerbi.visuals.ISelectionId[] = [];
         for (let i = 0; i < provinceNames.length; i++) {
             if (MapDataService.normalizeRegionName(provinceNames[i]) !== normProvince) continue;
-            ids.push(this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[0], i).createSelectionId());
+            const id = this.createRowSelectionId(i, 0);
+            if (id) ids.push(id);
         }
         if (ids.length > 0) this.selectionManager.select(ids, false);
     }
@@ -845,11 +1031,24 @@ export class Visual implements IVisual {
         const ids: powerbi.visuals.ISelectionId[] = [];
         for (let i = 0; i < cityNames.length; i++) {
             if (MapDataService.normalizeRegionName(cityNames[i]) !== normCity) continue;
-            const builder = this.host.createSelectionIdBuilder().withCategory(this.rawCatColumns[0], i);
-            if (this.rawCatColumns[1]) builder.withCategory(this.rawCatColumns[1], i);
-            ids.push(builder.createSelectionId());
+            const id = this.createRowSelectionId(i, 1);
+            if (id) ids.push(id);
         }
         if (ids.length > 0) this.selectionManager.select(ids, false);
+    }
+
+    /** 同时兼容 table 与旧 categorical 映射的行选择标识 */
+    private createRowSelectionId(rowIndex: number, categoryLevel: number): powerbi.visuals.ISelectionId | undefined {
+        const builder = this.host.createSelectionIdBuilder();
+        if (this.rawTable) {
+            return builder.withTable(this.rawTable, rowIndex).createSelectionId();
+        }
+        if (this.rawCatColumns.length === 0) return undefined;
+        const lastLevel = Math.min(categoryLevel, this.rawCatColumns.length - 1);
+        for (let level = 0; level <= lastLevel; level++) {
+            builder.withCategory(this.rawCatColumns[level], rowIndex);
+        }
+        return builder.createSelectionId();
     }
 
     /** 从缓存分类列中查找某城市所属的省份名 */
@@ -867,7 +1066,7 @@ export class Visual implements IVisual {
     }
 
     private async resolveAdcode(regionName: string): Promise<string | null> {
-        let adcode = this.findRegionAdcodeFromMap(regionName, this.currentMapName);
+        const adcode = this.findRegionAdcodeFromMap(regionName, this.currentMapName);
         if (adcode) return adcode;
         if (!this.registeredMaps.has(MapDataService.CHINA_ADCODE)) {
             try {
@@ -979,6 +1178,7 @@ export class Visual implements IVisual {
         this.lastRenderedLevel = 1;
         this.previousDataKey = "";
         this.dataFingerprint = "";
+        this.currentDrillProvinceAdcode = "";
         this.selectionManager.clear();
         this.breadcrumbElement.style.display = "none";
         const data = this.level1DataPoints.length > 0 ? this.level1DataPoints : this.currentDataPoints;
@@ -990,7 +1190,7 @@ export class Visual implements IVisual {
         }
     }
 
-    private navigateToLevel2(): void {
+    private async navigateToLevel2(): Promise<void> {
         if (!this.chart) return;
         // 直辖市无地级层，"省份"层即区县层，回退到全国
         if (this.currentDrillIsMunicipality) { this.navigateToLevel1(); return; }
@@ -998,11 +1198,22 @@ export class Visual implements IVisual {
         const provinceName = this.currentDrillProvinceName || this.level2ParentName;
         if (!provinceName || this.level2DataPoints.length === 0) { this.navigateToLevel1(); return; }
 
-        const adcode = this.findRegionAdcodeFromMap(provinceName, "china")
+        const adcode = this.currentDrillProvinceAdcode
+            || this.findRegionAdcodeFromMap(provinceName, "china")
             || this.findRegionAdcodeFromMap(provinceName, this.currentMapName);
         if (!adcode) { this.navigateToLevel1(); return; }
+        const mapName = `map_${adcode}`;
+        if (!(echarts as any).getMap(mapName)) {
+            try {
+                echarts.registerMap(mapName, await this.mapDataService.getGeoJSON(adcode));
+                this.registeredMaps.add(adcode);
+            } catch (error) {
+                this.showOverlay(`加载地图数据失败: ${error.message}`, true);
+                return;
+            }
+        }
         this.currentAdcode = adcode;
-        this.currentMapName = `map_${adcode}`;
+        this.currentMapName = mapName;
         this.lastRenderedLevel = 2;
         this.currentDrillParentName = provinceName;
         this.previousDataKey = `2|${this.level2DataPoints.length}|${provinceName}`;

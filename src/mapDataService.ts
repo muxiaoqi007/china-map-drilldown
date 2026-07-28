@@ -20,28 +20,29 @@ const hunanGeo = require("./assets/hunan.json");
 const fujianGeo = require("./assets/fujian.json");
 const henanGeo = require("./assets/henan.json");
 const shaanxiGeo = require("./assets/shaanxi.json");
-// 其余省级行政区（按 adcode 命名）
-const tianjinGeo = require("./assets/120000.json");
-const hebeiGeo = require("./assets/130000.json");
-const shanxiGeo = require("./assets/140000.json");
-const neimengguGeo = require("./assets/150000.json");
-const liaoningGeo = require("./assets/210000.json");
-const jilinGeo = require("./assets/220000.json");
-const heilongjiangGeo = require("./assets/230000.json");
-const anhuiGeo = require("./assets/340000.json");
-const jiangxiGeo = require("./assets/360000.json");
-const guangxiGeo = require("./assets/450000.json");
-const hainanGeo = require("./assets/460000.json");
-const chongqingGeo = require("./assets/500000.json");
-const guizhouGeo = require("./assets/520000.json");
-const yunnanGeo = require("./assets/530000.json");
-const xizangGeo = require("./assets/540000.json");
-const gansuGeo = require("./assets/620000.json");
-const qinghaiGeo = require("./assets/630000.json");
-const ningxiaGeo = require("./assets/640000.json");
-const xinjiangGeo = require("./assets/650000.json");
-const hongkongGeo = require("./assets/810000.json");
-const macaoGeo = require("./assets/820000.json");
+// 其余省级行政区（统一使用拼音文件名）
+const tianjinGeo = require("./assets/tianjin.json");
+const hebeiGeo = require("./assets/hebei.json");
+const shanxiGeo = require("./assets/shanxi.json");
+const neimengguGeo = require("./assets/neimenggu.json");
+const liaoningGeo = require("./assets/liaoning.json");
+const jilinGeo = require("./assets/jilin.json");
+const heilongjiangGeo = require("./assets/heilongjiang.json");
+const anhuiGeo = require("./assets/anhui.json");
+const jiangxiGeo = require("./assets/jiangxi.json");
+const guangxiGeo = require("./assets/guangxi.json");
+const hainanGeo = require("./assets/hainan.json");
+const chongqingGeo = require("./assets/chongqing.json");
+const guizhouGeo = require("./assets/guizhou.json");
+const yunnanGeo = require("./assets/yunnan.json");
+const xizangGeo = require("./assets/xizang.json");
+const gansuGeo = require("./assets/gansu.json");
+const qinghaiGeo = require("./assets/qinghai.json");
+const ningxiaGeo = require("./assets/ningxia.json");
+const xinjiangGeo = require("./assets/xinjiang.json");
+const taiwanGeo = require("./assets/taiwan.json");
+const hongkongGeo = require("./assets/hongkong.json");
+const macaoGeo = require("./assets/macao.json");
 
 export interface DrillState {
     /** 当前层级：1=全国, 2=省内城市, 3=市内区县 */
@@ -77,8 +78,23 @@ export class MapDataService {
     /** 全国地图行政区划代码 */
     static readonly CHINA_ADCODE = "100000";
 
+    /** 省级名称到行政区划代码的固定映射，避免依赖文件名或名称后缀 */
+    private static readonly PROVINCE_ADCODES: { [name: string]: string } = {
+        "北京": "110000", "天津": "120000", "河北": "130000", "山西": "140000",
+        "内蒙古": "150000", "辽宁": "210000", "吉林": "220000", "黑龙江": "230000",
+        "上海": "310000", "江苏": "320000", "浙江": "330000", "安徽": "340000",
+        "福建": "350000", "江西": "360000", "山东": "370000", "河南": "410000",
+        "湖北": "420000", "湖南": "430000", "广东": "440000", "广西": "450000",
+        "海南": "460000", "重庆": "500000", "四川": "510000", "贵州": "520000",
+        "云南": "530000", "西藏": "540000", "陕西": "610000", "甘肃": "620000",
+        "青海": "630000", "宁夏": "640000", "新疆": "650000", "台湾": "710000",
+        "香港": "810000", "澳门": "820000"
+    };
+
     /** DataV GeoAtlas API 基础 URL（回退用） */
     static readonly GEO_API_BASE = "https://geo.datav.aliyun.com/areas_v3/bound";
+    /** GeoJSON.CN 回退源（DataV 缺少台湾等区域时使用） */
+    static readonly GEOJSON_CN_API_BASE = "https://geojson.cn/api/china";
 
     /** 打包的本地 GeoJSON 数据注册表（全国 + 33 个省级行政区） */
     private static readonly BUNDLED_GEO: { [adcode: string]: any } = {
@@ -114,6 +130,7 @@ export class MapDataService {
         "630000": qinghaiGeo,
         "640000": ningxiaGeo,
         "650000": xinjiangGeo,
+        "710000": taiwanGeo,
         "810000": hongkongGeo,
         "820000": macaoGeo,
     };
@@ -136,16 +153,43 @@ export class MapDataService {
             return this.cache.get(adcode);
         }
 
-        const url = `${MapDataService.GEO_API_BASE}/${adcode}_full.json`;
+        const urls = [
+            `${MapDataService.GEO_API_BASE}/${adcode}_full.json`,
+            ...this.getFallbackUrls(adcode)
+        ];
+        let lastError: any;
 
-        try {
-            const geoJson = await this.fetchJSON(url);
-            this.cache.set(adcode, geoJson);
-            return geoJson;
-        } catch (error) {
-            console.error(`获取地图数据失败 (adcode: ${adcode}):`, error);
-            throw new Error(`无法获取地图数据，请检查网络连接。行政区划代码: ${adcode}`);
+        for (const url of urls) {
+            try {
+                const geoJson = this.normalizeGeoJSON(await this.fetchJSON(url));
+                this.cache.set(adcode, geoJson);
+                return geoJson;
+            } catch (error) {
+                lastError = error;
+            }
         }
+
+        console.error(`获取地图数据失败 (adcode: ${adcode}):`, lastError);
+        throw new Error(`无法获取地图数据，请检查网络连接。行政区划代码: ${adcode}`);
+    }
+
+    /** 台湾的市级文件采用“省代码/市代码”路径，其余省级文件直接按代码读取 */
+    private getFallbackUrls(adcode: string): string[] {
+        if (/^71\d{4}$/.test(adcode) && adcode !== "710000") {
+            return [`${MapDataService.GEOJSON_CN_API_BASE}/710000/${adcode}.json`];
+        }
+        return [`${MapDataService.GEOJSON_CN_API_BASE}/${adcode}.json`];
+    }
+
+    /** 兼容 GeoJSON.CN 的 code/fullname 字段，统一为现有下钻逻辑使用的 adcode/name */
+    private normalizeGeoJSON(geoJson: any): any {
+        if (!geoJson?.features) return geoJson;
+        for (const feature of geoJson.features) {
+            const props = feature.properties || (feature.properties = {});
+            if (!props.adcode && props.code) props.adcode = props.code;
+            if (props.fullname) props.name = props.fullname;
+        }
+        return geoJson;
     }
 
     /**
@@ -179,8 +223,15 @@ export class MapDataService {
     static normalizeRegionName(name: string): string {
         if (!name) return "";
         return name
-            .replace(/(省|市|自治区|特别行政区|壮族|回族|维吾尔|藏族)/g, "")
-            .trim();
+            .normalize("NFKC")
+            .replace(/臺/g, "台")
+            .replace(/\s+/g, "")
+            .replace(/(特别行政区|维吾尔自治区|壮族自治区|回族自治区|自治区|省|市)$/g, "");
+    }
+
+    /** 获取省级行政区划代码；省级匹配统一走代码，不受 GeoJSON 文件名影响 */
+    static getProvinceAdcode(name: string): string | null {
+        return MapDataService.PROVINCE_ADCODES[MapDataService.normalizeRegionName(name)] || null;
     }
 
     /**

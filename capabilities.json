@@ -140,21 +140,17 @@
                     "tooltips": { "max": 5 }
                 }
             ],
-            "categorical": {
-                "categories": {
+            "table": {
+                "rows": {
                     "select": [
                         { "for": { "in": "province" } },
                         { "for": { "in": "city" } },
-                        { "for": { "in": "district" } }
-                    ]
-                },
-                "values": {
-                    "select": [
+                        { "for": { "in": "district" } },
                         { "bind": { "to": "measure" } },
                         { "for": { "in": "tooltips" } }
                     ],
                     "dataReductionAlgorithm": {
-                        "top": { "count": 50000 }
+                        "window": { "count": 50000 }
                     }
                 }
             }
@@ -165,7 +161,8 @@
             "name": "WebAccess",
             "essential": false,
             "parameters": [
-                "https://geo.datav.aliyun.com"
+                "https://geo.datav.aliyun.com",
+                "https://geojson.cn"
             ]
         }
     ]
