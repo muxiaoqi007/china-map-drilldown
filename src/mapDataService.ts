@@ -235,6 +235,22 @@ export class MapDataService {
     }
 
     /**
+     * 移除 ECharts 会自动绘制成右下角小图的 100000_JD 特殊要素。
+     * 海南省几何中的真实南海岛屿保持不变，用于“完整显示”模式。
+     */
+    static removeBuiltInSouthChinaSeaInset(geoJson: any): any {
+        if (!geoJson?.features) return geoJson;
+
+        return {
+            ...geoJson,
+            features: geoJson.features.filter((feature: any) => {
+                const adcode = String(feature.properties?.adcode || "");
+                return adcode !== "100000_JD" && !adcode.endsWith("_JD");
+            })
+        };
+    }
+
+    /**
      * 过滤南海诸岛相关 features，同时提取南海特征供小图使用
      *
      * DataV 100000_full.json 中南海诸岛分布在两处:

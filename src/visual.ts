@@ -8,6 +8,7 @@
 import powerbi from "powerbi-visuals-api";
 import * as echarts from "echarts";
 import { FormattingSettingsService } from "powerbi-visuals-utils-formattingmodel";
+import { valueFormatter } from "powerbi-visuals-utils-formattingutils";
 import { MapDataService, DrillState, DataPoint } from "./mapDataService";
 import { VisualFormattingSettingsModel } from "./settings";
 import "./../style/visual.less";
@@ -19,6 +20,7 @@ import ISelectionManager = powerbi.extensibility.ISelectionManager;
 import IVisualHost = powerbi.extensibility.visual.IVisualHost;
 import DataView = powerbi.DataView;
 import DataViewCategoryColumn = powerbi.DataViewCategoryColumn;
+import DataViewMetadataColumn = powerbi.DataViewMetadataColumn;
 import DataViewTable = powerbi.DataViewTable;
 
 /** 格式化配置提取接口 */
@@ -79,7 +81,9 @@ export class Visual implements IVisual {
     private rawMeasureValues: number[] = [];
     private rawTable: DataViewTable | null = null;
 
-    private tooltipColumns: Array<{ displayName: string; values: string[] }> = [];
+    private tooltipColumns: Array<{ displayName: string; values: any[]; formatString: string }> = [];
+    private measureDisplayName: string = "数值";
+    private measureFormatString: string = "#,0.##";
     private scsInsetFeatures: any[] = [];
 
     constructor(options: VisualConstructorOptions) {
@@ -141,7 +145,10 @@ export class Visual implements IVisual {
 
             // 数据指纹：底层数据未变化时跳过重绘，保住内部下钻状态
             // （Power BI 在内部下钻后会重复发送全量数据，若不跳过会把省级地图重置回全国）
-            const fingerprint = `${this.rawCatNames.map((c) => c.length).join(",")}|${this.rawMeasureValues.length}|${parsedData.level}|${parsedData.dataPoints.length}`;
+            const tooltipFormatFingerprint = this.tooltipColumns
+                .map((column) => column.formatString)
+                .join(",");
+            const fingerprint = `${this.rawCatNames.map((c) => c.length).join(",")}|${this.rawMeasureValues.length}|${parsedData.level}|${parsedData.dataPoints.length}|${this.measureFormatString}|${tooltipFormatFingerprint}`;
             if (fingerprint === this.dataFingerprint && this.lastRenderedLevel >= 2) {
                 return;
             }
@@ -210,6 +217,8 @@ export class Visual implements IVisual {
         }
 
         // 提取度量值 (values[0])
+        const measureSource = values[0]?.source || values[0]?.values?.[0]?.source;
+        this.updateMeasureMetadata(measureSource);
         const flatValues = this.extractValues(values[0], rowCount, primaryCat);
         if (!flatValues) return null;
         this.rawMeasureValues = flatValues.slice();
@@ -228,11 +237,12 @@ export class Visual implements IVisual {
                 colValues = valCol.values[0].values || [];
             }
             if (displayName) {
-                const strValues: string[] = [];
-                for (let i = 0; i < colValues.length; i++) {
-                    strValues.push(String(colValues[i] ?? ""));
-                }
-                this.tooltipColumns.push({ displayName, values: strValues });
+                const source = valCol?.source || valCol?.values?.[0]?.source;
+                this.tooltipColumns.push({
+                    displayName,
+                    values: colValues,
+                    formatString: this.getColumnFormatString(source)
+                });
             }
         }
 
@@ -298,6 +308,7 @@ export class Visual implements IVisual {
 
         this.rawTable = table;
         this.rawCatColumns = [];
+        this.updateMeasureMetadata(columns[measureIndex]);
         const provinceNames = rows.map((row) => String(row[provinceIndex] ?? ""));
         const cityNames = cityIndex >= 0 ? rows.map((row) => String(row[cityIndex] ?? "")) : [];
         const districtNames = districtIndex >= 0 ? rows.map((row) => String(row[districtIndex] ?? "")) : [];
@@ -311,7 +322,8 @@ export class Visual implements IVisual {
             if (!columns[ci].roles?.tooltips) continue;
             this.tooltipColumns.push({
                 displayName: columns[ci].displayName || "",
-                values: rows.map((row) => String(row[ci] ?? ""))
+                values: rows.map((row) => row[ci]),
+                formatString: this.getColumnFormatString(columns[ci])
             });
         }
 
@@ -546,7 +558,10 @@ export class Visual implements IVisual {
         return rowIndices.map((rowIdx) =>
             this.tooltipColumns
                 .filter((col) => rowIdx < col.values.length)
-                .map((col) => ({ displayName: col.displayName, value: col.values[rowIdx] }))
+                .map((col) => ({
+                    displayName: col.displayName,
+                    value: this.formatValue(col.values[rowIdx], col.formatString)
+                }))
         );
     }
 
@@ -563,7 +578,8 @@ export class Visual implements IVisual {
             if (!adcode) {
                 if (!this.registeredMaps.has(MapDataService.CHINA_ADCODE)) {
                     try {
-                        const chinaGeo = await this.mapDataService.getGeoJSON(MapDataService.CHINA_ADCODE);
+                        const rawChinaGeo = await this.mapDataService.getGeoJSON(MapDataService.CHINA_ADCODE);
+                        const chinaGeo = MapDataService.removeBuiltInSouthChinaSeaInset(rawChinaGeo);
                         echarts.registerMap("china", chinaGeo);
                         this.registeredMaps.add(MapDataService.CHINA_ADCODE);
                     } catch (e) { /* ignore */ }
@@ -592,6 +608,9 @@ export class Visual implements IVisual {
                     echarts.registerMap(mapName, geoJson);
                     this.registeredMaps.add(cacheKey);
                 } else {
+                    if (targetAdcode === MapDataService.CHINA_ADCODE) {
+                        geoJson = MapDataService.removeBuiltInSouthChinaSeaInset(geoJson);
+                    }
                     this.scsInsetFeatures = [];
                     if (!this.registeredMaps.has(cacheKey)) {
                         echarts.registerMap(mapName, geoJson);
@@ -1259,12 +1278,33 @@ export class Visual implements IVisual {
     private getLevelLabel(level: number): string {
         switch (level) { case 1: return "省份数据"; case 2: return "城市数据"; case 3: return "区县数据"; default: return "数据"; }
     }
-    private getMeasureName(): string { return "数值"; }
+    private updateMeasureMetadata(column?: DataViewMetadataColumn): void {
+        this.measureDisplayName = column?.displayName || "数值";
+        this.measureFormatString = this.getColumnFormatString(column);
+    }
+
+    private getColumnFormatString(column?: DataViewMetadataColumn): string {
+        if (!column) return "#,0.##";
+        return valueFormatter.getFormatString(
+            column,
+            { objectName: "general", propertyName: "formatString" }
+        ) || column.format || "#,0.##";
+    }
+
+    private formatValue(value: any, formatString?: string): string {
+        if (value == null) return "";
+        return valueFormatter.format(
+            value,
+            formatString || "#,0.##",
+            false,
+            this.host.locale
+        );
+    }
+
+    private getMeasureName(): string { return this.measureDisplayName; }
     private formatNumber(value: number): string {
         if (value == null || isNaN(value)) return "0";
-        if (Math.abs(value) >= 100000000) return (value / 100000000).toFixed(2) + "亿";
-        if (Math.abs(value) >= 10000) return (value / 10000).toFixed(2) + "万";
-        return value.toLocaleString("zh-CN");
+        return this.formatValue(value, this.measureFormatString);
     }
     private handleResize = (): void => { this.chart?.resize(); };
 

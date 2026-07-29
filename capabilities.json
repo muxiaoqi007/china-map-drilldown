@@ -37,6 +37,17 @@
         }
     ],
     "objects": {
+        "general": {
+            "properties": {
+                "formatString": {
+                    "type": {
+                        "formatting": {
+                            "formatString": true
+                        }
+                    }
+                }
+            }
+        },
         "mapColor": {
             "displayName": "地图配色",
             "properties": {
