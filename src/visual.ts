@@ -355,15 +355,17 @@ export class Visual implements IVisual {
     private buildTableDrillState(level: number, parentName: string, names: string[]): DrillState {
         const grouped = new Map<string, { name: string; total: number; firstIdx: number }>();
         for (let i = 0; i < names.length; i++) {
+            const value = this.rawMeasureValues[i] ?? 0;
+            if (isNaN(value)) continue;
             const normalized = MapDataService.normalizeRegionName(names[i]);
             const key = normalized || names[i];
             const existing = grouped.get(key);
             if (existing) {
-                existing.total += this.rawMeasureValues[i] ?? 0;
+                existing.total += value;
             } else {
                 grouped.set(key, {
                     name: names[i],
-                    total: this.rawMeasureValues[i] ?? 0,
+                    total: value,
                     firstIdx: i
                 });
             }
@@ -385,10 +387,8 @@ export class Visual implements IVisual {
             maxValue = Math.max(maxValue, item.total);
         });
 
-        if (minValue === maxValue && dataPoints.length > 1) {
-            minValue = maxValue > 0 ? 0 : maxValue - 1;
-            maxValue = maxValue > 0 ? maxValue * 1.1 : 1;
-        }
+        // 含单数据点：min==max 时扩展范围，避免 visualMap 退化导致全图同色
+        [minValue, maxValue] = this.expandDegenerateRange(minValue, maxValue);
         return {
             level,
             parentName,
@@ -549,10 +549,8 @@ export class Visual implements IVisual {
             minValue = Math.min(minValue, value);
             maxValue = Math.max(maxValue, value);
         }
-        if (minValue === maxValue && dataPoints.length > 1) {
-            minValue = maxValue > 0 ? 0 : maxValue - 1;
-            maxValue = maxValue > 0 ? maxValue * 1.1 : 1;
-        }
+        // 含单数据点：min==max 时扩展范围，避免 visualMap 退化导致全图同色
+        [minValue, maxValue] = this.expandDegenerateRange(minValue, maxValue);
         return {
             level,
             parentName: level >= 2 ? primaryName : "",
@@ -742,10 +740,17 @@ export class Visual implements IVisual {
         };
 
         if (fmt.showLegend) {
+            // 范围无效（相等或颠倒）时回退自动范围，避免 visualMap 退化导致全图同色或颜色颠倒
+            let vmMin = fmt.minValue || state.minValue;
+            let vmMax = fmt.maxValue || state.maxValue;
+            if (!(vmMin < vmMax)) {
+                vmMin = state.minValue;
+                vmMax = state.maxValue;
+            }
             option.visualMap = {
                 type: "continuous",
-                min: fmt.minValue || state.minValue,
-                max: fmt.maxValue || state.maxValue,
+                min: vmMin,
+                max: vmMax,
                 left: "left", bottom: 20,
                 formatter: (value: number) => this.formatNumber(value),
                 inRange: { color: [fmt.minColor, fmt.maxColor] },
@@ -772,11 +777,13 @@ export class Visual implements IVisual {
     }
 
     private formatLabel(params: any, fmt: MapFormatConfig): string {
+        // 无数据区域 ECharts 传入 NaN，不能显示成 "0"，回退为区域名称
+        const hasValue = params.value != null && !isNaN(params.value);
         switch (fmt.labelContent) {
             case "value":
-                return params.value != null ? this.formatNumber(params.value) : params.name;
+                return hasValue ? this.formatNumber(params.value) : params.name;
             case "nameAndValue":
-                return params.value != null ? `${params.name}\n${this.formatNumber(params.value)}` : params.name;
+                return hasValue ? `${params.name}\n${this.formatNumber(params.value)}` : params.name;
             default:
                 return params.name;
         }
@@ -974,10 +981,12 @@ export class Visual implements IVisual {
         for (let i = 0; i < provinceNames.length; i++) {
             if (provinceNames[i] !== provinceName
                 && MapDataService.normalizeRegionName(provinceNames[i]) !== MapDataService.normalizeRegionName(provinceName)) continue;
+            const value = values[i] ?? 0;
+            if (isNaN(value)) continue;
             const city = cityNames[i];
             const existing = cityAgg.get(city);
-            if (existing) { existing.total += (values[i] ?? 0); }
-            else { cityAgg.set(city, { total: values[i] ?? 0, firstIdx: i }); }
+            if (existing) { existing.total += value; }
+            else { cityAgg.set(city, { total: value, firstIdx: i }); }
         }
         if (cityAgg.size === 0) return;
 
@@ -989,7 +998,7 @@ export class Visual implements IVisual {
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
         });
-        if (minVal === maxVal && cityDataPoints.length > 1) { minVal = maxVal > 0 ? 0 : maxVal - 1; maxVal = maxVal > 0 ? maxVal * 1.1 : 1; }
+        [minVal, maxVal] = this.expandDegenerateRange(minVal, maxVal);
 
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
@@ -1013,10 +1022,12 @@ export class Visual implements IVisual {
         const districtAgg = new Map<string, { total: number; firstIdx: number }>();
         for (let i = 0; i < provinceNames.length; i++) {
             if (MapDataService.normalizeRegionName(provinceNames[i]) !== normProvince) continue;
+            const value = values[i] ?? 0;
+            if (isNaN(value)) continue;
             const district = districtNames[i];
             const existing = districtAgg.get(district);
-            if (existing) { existing.total += (values[i] ?? 0); }
-            else { districtAgg.set(district, { total: values[i] ?? 0, firstIdx: i }); }
+            if (existing) { existing.total += value; }
+            else { districtAgg.set(district, { total: value, firstIdx: i }); }
         }
         if (districtAgg.size === 0) return;
 
@@ -1028,7 +1039,7 @@ export class Visual implements IVisual {
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
         });
-        if (minVal === maxVal && districtDataPoints.length > 1) { minVal = maxVal > 0 ? 0 : maxVal - 1; maxVal = maxVal > 0 ? maxVal * 1.1 : 1; }
+        [minVal, maxVal] = this.expandDegenerateRange(minVal, maxVal);
 
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
@@ -1055,10 +1066,12 @@ export class Visual implements IVisual {
         for (let i = 0; i < cityNames.length; i++) {
             if (cityNames[i] !== cityName
                 && MapDataService.normalizeRegionName(cityNames[i]) !== MapDataService.normalizeRegionName(cityName)) continue;
+            const value = values[i] ?? 0;
+            if (isNaN(value)) continue;
             const district = districtNames[i];
             const existing = districtAgg.get(district);
-            if (existing) { existing.total += (values[i] ?? 0); }
-            else { districtAgg.set(district, { total: values[i] ?? 0, firstIdx: i }); }
+            if (existing) { existing.total += value; }
+            else { districtAgg.set(district, { total: value, firstIdx: i }); }
         }
         if (districtAgg.size === 0) {
             await this.crossFilter(cityName);
@@ -1073,7 +1086,7 @@ export class Visual implements IVisual {
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
         });
-        if (minVal === maxVal && districtDataPoints.length > 1) { minVal = maxVal > 0 ? 0 : maxVal - 1; maxVal = maxVal > 0 ? maxVal * 1.1 : 1; }
+        [minVal, maxVal] = this.expandDegenerateRange(minVal, maxVal);
 
         let adcode = this.findRegionAdcodeFromMap(cityName, this.currentMapName);
         if (!adcode) adcode = await this.resolveAdcode(cityName);
@@ -1225,6 +1238,20 @@ export class Visual implements IVisual {
 
     /* ═══ 辅助 ═══ */
 
+    /**
+     * 扩展 min==max 的退化了的颜色范围。
+     * 所有值相等或只有一个数据点时，visualMap 的 min==max 无法做颜色映射，
+     * ECharts 会把整幅地图渲染成同一中间色、图例折叠成单个值。
+     * 扩展后让该值落在范围一端附近，保持“值大深、值小浅”的语义：
+     *   正值 → [0, v*1.1]；负值 → [v*1.1, 0]；全零 → [0, 1]
+     */
+    private expandDegenerateRange(minValue: number, maxValue: number): [number, number] {
+        if (minValue !== maxValue) return [minValue, maxValue];
+        if (maxValue > 0) return [0, maxValue * 1.1];
+        if (maxValue < 0) return [maxValue * 1.1, 0];
+        return [0, 1];
+    }
+
     private findRegionAdcodeFromMap(regionName: string, mapName: string): string | null {
         const mapGeo = (echarts as any).getMap(mapName);
         const features = mapGeo?.geoJSON?.features || [];
@@ -1348,7 +1375,7 @@ export class Visual implements IVisual {
     private buildRestoreState(level: number, parentName: string, dataPoints: DataPoint[]): DrillState {
         let minV = Infinity, maxV = -Infinity;
         for (const dp of dataPoints) { minV = Math.min(minV, dp.value); maxV = Math.max(maxV, dp.value); }
-        if (minV === maxV && dataPoints.length > 1) { minV = maxV > 0 ? 0 : maxV - 1; maxV = maxV > 0 ? maxV * 1.1 : 1; }
+        [minV, maxV] = this.expandDegenerateRange(minV, maxV);
         return { level, parentName, parentAdcode: MapDataService.CHINA_ADCODE, mapName: this.currentMapName, dataPoints, minValue: minV, maxValue: maxV };
     }
 

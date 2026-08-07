@@ -4,7 +4,7 @@
         "displayName": "中国地图下钻 V2",
         "guid": "chinaMapDrilldownV2F4A1C8D973E64B5AA27D1E6C80B42951",
         "visualClassName": "Visual",
-        "version": "2.2.5.0",
+        "version": "2.2.6.0",
         "description": "基于 ECharts 的中国地图层级下钻可视化，支持省→市→区三级 Choropleth 填充地图",
         "supportUrl": "https://github.com",
         "gitHubUrl": ""
@@ -22,5 +22,5 @@
     "capabilities": "capabilities.json",
     "dependencies": null,
     "stringResources": [],
-    "version": "2.2.5.0"
+    "version": "2.2.6.0"
 }
