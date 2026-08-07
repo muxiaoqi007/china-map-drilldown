@@ -75,6 +75,10 @@ export class Visual implements IVisual {
     private lastUpdateOptions: VisualUpdateOptions | null = null;
     /** 底层数据指纹：仅在数据真正变化时重绘，避免 Power BI 重复发送全量数据覆盖内部下钻状态 */
     private dataFingerprint: string = "";
+    /** 是否由当前内部下钻应用了 Power BI 联动选择 */
+    private drillSelectionActive: boolean = false;
+    /** 忽略由本视觉自己发起的 selection 回调，只处理宿主端清除选择 */
+    private applyingDrillSelection: boolean = false;
 
     private rawCatColumns: DataViewCategoryColumn[] = [];
     private rawCatNames: string[][] = [];
@@ -90,6 +94,7 @@ export class Visual implements IVisual {
         this.host = options.host;
         this.target = options.element;
         this.selectionManager = this.host.createSelectionManager();
+        this.selectionManager.registerOnSelectCallback((ids) => this.handleHostSelectionChanged(ids));
         this.formattingSettingsService = new FormattingSettingsService();
         this.mapDataService = new MapDataService();
 
@@ -145,11 +150,17 @@ export class Visual implements IVisual {
 
             // 数据指纹：底层数据未变化时跳过重绘，保住内部下钻状态
             // （Power BI 在内部下钻后会重复发送全量数据，若不跳过会把省级地图重置回全国）
-            const tooltipFormatFingerprint = this.tooltipColumns
-                .map((column) => column.formatString)
-                .join(",");
-            const fingerprint = `${this.rawCatNames.map((c) => c.length).join(",")}|${this.rawMeasureValues.length}|${parsedData.level}|${parsedData.dataPoints.length}|${this.measureFormatString}|${tooltipFormatFingerprint}`;
-            if (fingerprint === this.dataFingerprint && this.lastRenderedLevel >= 2) {
+            const fingerprint = this.buildDataFingerprint(parsedData);
+            const selectionWasCleared = this.drillSelectionActive
+                && this.lastRenderedLevel >= 2
+                && this.selectionManager.getSelectionIds().length === 0;
+
+            // 用户取消城市/区县选中时，保留当前下钻地图，并恢复父级区域联动。
+            // 例如地图仍在黑龙江省时，右侧表格应恢复为“黑龙江省”，而不是全国。
+            if (selectionWasCleared) {
+                void this.restoreCurrentLevelLinkage();
+                return;
+            } else if (fingerprint === this.dataFingerprint && this.lastRenderedLevel >= 2) {
                 return;
             }
             this.dataFingerprint = fingerprint;
@@ -157,10 +168,8 @@ export class Visual implements IVisual {
             const dataKey = `${parsedData.level}|${parsedData.dataPoints.length}|${parsedData.parentName}`;
             if (dataKey !== this.previousDataKey) {
                 if (parsedData.level <= 1 && this.lastRenderedLevel >= 2) {
-                    this.currentAdcode = MapDataService.CHINA_ADCODE;
-                    const resetFmt = this.getFormatConfig();
-                    this.currentMapName = resetFmt.southChinaSeaMode === "inset" ? "china_no_scs" : "china";
-                    this.selectionManager.clear();
+                    this.resetDrillTracking();
+                    void this.selectionManager.clear();
                 }
                 this.previousDataKey = dataKey;
             }
@@ -565,6 +574,41 @@ export class Visual implements IVisual {
         );
     }
 
+    /**
+     * 按实际分类、度量和工具提示内容生成稳定指纹。
+     * 仅比较行数会把“行数相同但过滤内容已变”误判为重复更新。
+     */
+    private buildDataFingerprint(drillState: DrillState): string {
+        let hash = 2166136261;
+        const append = (value: any): void => {
+            const text = value == null ? "<null>" : String(value);
+            for (let i = 0; i < text.length; i++) {
+                hash ^= text.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+            }
+            // 字段分隔符，避免 ["ab", "c"] 与 ["a", "bc"] 产生相同输入序列。
+            hash ^= 31;
+            hash = Math.imul(hash, 16777619);
+        };
+
+        append(drillState.level);
+        append(drillState.parentName);
+        for (const category of this.rawCatNames) {
+            append(category.length);
+            for (const name of category) append(name);
+        }
+        append(this.rawMeasureValues.length);
+        for (const value of this.rawMeasureValues) append(value);
+        append(this.measureFormatString);
+        for (const column of this.tooltipColumns) {
+            append(column.displayName);
+            append(column.formatString);
+            append(column.values.length);
+            for (const value of column.values) append(value);
+        }
+        return `${this.rawCatNames.map((category) => category.length).join(",")}|${hash >>> 0}`;
+    }
+
     /* ═══ 地图渲染 ═══ */
 
     private async renderMap(drillState: DrillState): Promise<void> {
@@ -859,41 +903,54 @@ export class Visual implements IVisual {
                 if (params.name) this.drillDownToCity(params.name);
             } else {
                 if (dpIndex != null && dpIndex < this.currentDataPoints.length) {
-                    this.handleDistrictClick(this.currentDataPoints[dpIndex]);
+                    void this.handleLeafClick(this.currentDataPoints[dpIndex]);
                 }
             }
         });
     }
 
     /**
-     * 区县（叶子）层点击：选中该区联动表格；若点击导致取消选中（selection 变空），
-     * 自动恢复整市多选，避免表格失去过滤上下文。
+     * 叶子层点击：三字段模式为区县，两字段模式为城市。
+     * 若再次点击导致 selection 变空，自动恢复父级城市/省份多选，
+     * 避免其他图表跳回全国数据。
      */
-    private async handleDistrictClick(dp: DataPoint): Promise<void> {
+    private async handleLeafClick(dp: DataPoint): Promise<void> {
         if (!dp.selectionId) return;
-        await this.selectionManager.select(dp.selectionId);
-        if (this.selectionManager.getSelectionIds().length === 0) {
-            this.restoreCurrentLevelLinkage();
+        let selectedIds: powerbi.extensibility.ISelectionId[] = [];
+        this.applyingDrillSelection = true;
+        try {
+            selectedIds = await this.selectionManager.select(dp.selectionId);
+            this.drillSelectionActive = selectedIds.length > 0;
+        } finally {
+            this.applyingDrillSelection = false;
+        }
+        if (!this.drillSelectionActive) {
+            await this.restoreCurrentLevelLinkage();
         }
     }
 
     /** 按当前下钻层级重新应用对应的整区域多选（恢复表格联动） */
-    private restoreCurrentLevelLinkage(): void {
+    private async restoreCurrentLevelLinkage(): Promise<void> {
         if (this.lastRenderedLevel === 3 && this.currentDrillParentName) {
             if (this.currentDrillIsMunicipality) {
-                this.selectProvinceMulti(MapDataService.normalizeRegionName(this.currentDrillParentName));
+                await this.selectProvinceMulti(MapDataService.normalizeRegionName(this.currentDrillParentName));
             } else {
-                this.selectCityMulti(this.currentDrillParentName);
+                await this.selectCityMulti(this.currentDrillParentName);
             }
             return;
         }
         if (this.level2ParentName) {
-            this.selectProvinceMulti(MapDataService.normalizeRegionName(this.level2ParentName));
+            await this.selectProvinceMulti(MapDataService.normalizeRegionName(this.level2ParentName));
         }
     }
 
     private async drillDownToProvince(provinceName: string): Promise<void> {
-        if (!this.chart || this.rawCatNames.length < 2) return;
+        if (!this.chart) return;
+        // 仅配置省份时，省份就是叶子层：直接联动其他图表，再次点击正常取消。
+        if (this.rawCatNames.length < 2) {
+            await this.crossFilter(provinceName);
+            return;
+        }
         const provinceNames = this.rawCatNames[0];
         const cityNames = this.rawCatNames[1];
         const values = this.rawMeasureValues;
@@ -940,7 +997,7 @@ export class Visual implements IVisual {
         this.currentDrillProvinceAdcode = adcode;
         await this.loadAndRenderDrillMap(adcode, provinceName, 2, cityDataPoints, minVal, maxVal);
         // 联动表格：多选该省全部数据行，使表格过滤到整个省（数据指纹守卫保证地图不受影响）
-        this.selectProvinceMulti(normProvince);
+        await this.selectProvinceMulti(normProvince);
     }
 
     /**
@@ -982,11 +1039,14 @@ export class Visual implements IVisual {
         this.currentDrillIsMunicipality = true;
         await this.loadAndRenderDrillMap(adcode, provinceName, 3, districtDataPoints, minVal, maxVal);
         // 联动表格：多选该直辖市全部数据行
-        this.selectProvinceMulti(normProvince);
+        await this.selectProvinceMulti(normProvince);
     }
 
     private async drillDownToCity(cityName: string): Promise<void> {
-        if (!this.chart || this.rawCatNames.length < 3) { this.crossFilter(cityName); return; }
+        if (!this.chart || this.rawCatNames.length < 3) {
+            await this.crossFilter(cityName);
+            return;
+        }
         const cityNames = this.rawCatNames[1];
         const districtNames = this.rawCatNames[2];
         const values = this.rawMeasureValues;
@@ -1000,7 +1060,10 @@ export class Visual implements IVisual {
             if (existing) { existing.total += (values[i] ?? 0); }
             else { districtAgg.set(district, { total: values[i] ?? 0, firstIdx: i }); }
         }
-        if (districtAgg.size === 0) { this.crossFilter(cityName); return; }
+        if (districtAgg.size === 0) {
+            await this.crossFilter(cityName);
+            return;
+        }
 
         const districtDataPoints: DataPoint[] = [];
         let minVal = Infinity, maxVal = -Infinity;
@@ -1014,23 +1077,26 @@ export class Visual implements IVisual {
 
         let adcode = this.findRegionAdcodeFromMap(cityName, this.currentMapName);
         if (!adcode) adcode = await this.resolveAdcode(cityName);
-        if (!adcode) { this.crossFilter(cityName); return; }
+        if (!adcode) {
+            await this.crossFilter(cityName);
+            return;
+        }
         this.currentDrillIsMunicipality = false;
         this.currentDrillProvinceName = this.findProvinceOfCity(cityName) || this.currentDrillProvinceName;
         await this.loadAndRenderDrillMap(adcode, cityName, 3, districtDataPoints, minVal, maxVal);
         // 联动表格：多选该市全部数据行，使表格过滤到整个市
-        this.selectCityMulti(cityName);
+        await this.selectCityMulti(cityName);
     }
 
-    private crossFilter(name: string): void {
+    private async crossFilter(name: string): Promise<void> {
         const dp = this.currentDataPoints.find(
             (d) => d.name === name || MapDataService.normalizeRegionName(d.name) === MapDataService.normalizeRegionName(name)
         );
-        if (dp?.selectionId) this.selectionManager.select(dp.selectionId);
+        if (dp?.selectionId) await this.handleLeafClick(dp);
     }
 
     /** 多选该省全部数据行 → 表格等其他视觉过滤到整个省（而非单行） */
-    private selectProvinceMulti(normProvince: string): void {
+    private async selectProvinceMulti(normProvince: string): Promise<void> {
         if (this.rawCatNames.length < 1) return;
         const provinceNames = this.rawCatNames[0];
         const ids: powerbi.visuals.ISelectionId[] = [];
@@ -1039,11 +1105,11 @@ export class Visual implements IVisual {
             const id = this.createRowSelectionId(i, 0);
             if (id) ids.push(id);
         }
-        if (ids.length > 0) this.selectionManager.select(ids, false);
+        await this.applyDrillSelection(ids);
     }
 
     /** 多选该市全部数据行 → 表格等其他视觉过滤到整个市 */
-    private selectCityMulti(cityName: string): void {
+    private async selectCityMulti(cityName: string): Promise<void> {
         if (this.rawCatNames.length < 2) return;
         const cityNames = this.rawCatNames[1];
         const normCity = MapDataService.normalizeRegionName(cityName);
@@ -1053,7 +1119,30 @@ export class Visual implements IVisual {
             const id = this.createRowSelectionId(i, 1);
             if (id) ids.push(id);
         }
-        if (ids.length > 0) this.selectionManager.select(ids, false);
+        await this.applyDrillSelection(ids);
+    }
+
+    /** 应用下钻联动并记录选择状态，用于识别 Power BI 视觉对象头的“清除选择”。 */
+    private async applyDrillSelection(ids: powerbi.visuals.ISelectionId[]): Promise<void> {
+        if (ids.length === 0) return;
+        this.drillSelectionActive = true;
+        this.applyingDrillSelection = true;
+        try {
+            const selectedIds = await this.selectionManager.select(ids, false);
+            this.drillSelectionActive = selectedIds.length > 0;
+        } catch (error) {
+            this.drillSelectionActive = false;
+            console.warn("[ChinaMap] 应用联动选择失败:", error);
+        } finally {
+            this.applyingDrillSelection = false;
+        }
+    }
+
+    /** Power BI 宿主清除 selection 时，恢复当前下钻区域的表格联动。 */
+    private handleHostSelectionChanged(ids: powerbi.extensibility.ISelectionId[]): void {
+        if (this.applyingDrillSelection || ids.length > 0) return;
+        if (!this.drillSelectionActive || this.lastRenderedLevel < 2) return;
+        void this.restoreCurrentLevelLinkage();
     }
 
     /** 同时兼容 table 与旧 categorical 映射的行选择标识 */
@@ -1189,17 +1278,29 @@ export class Visual implements IVisual {
         return sep;
     }
 
-    private navigateToLevel1(): void {
-        if (!this.chart) return;
+    /** 清理只属于内部下钻的导航和联动状态。 */
+    private resetDrillTracking(): void {
         this.currentAdcode = MapDataService.CHINA_ADCODE;
-        const fmtNow = this.getFormatConfig();
-        this.currentMapName = fmtNow.southChinaSeaMode === "inset" ? "china_no_scs" : "china";
-        this.lastRenderedLevel = 1;
+        const fmt = this.getFormatConfig();
+        this.currentMapName = fmt.southChinaSeaMode === "inset" ? "china_no_scs" : "china";
+        this.lastRenderedLevel = 0;
         this.previousDataKey = "";
         this.dataFingerprint = "";
+        this.currentDrillParentName = "";
+        this.currentDrillProvinceName = "";
         this.currentDrillProvinceAdcode = "";
-        this.selectionManager.clear();
+        this.currentDrillIsMunicipality = false;
+        this.level2DataPoints = [];
+        this.level2ParentName = "";
+        this.drillSelectionActive = false;
         this.breadcrumbElement.style.display = "none";
+    }
+
+    private navigateToLevel1(): void {
+        if (!this.chart) return;
+        this.resetDrillTracking();
+        this.lastRenderedLevel = 1;
+        void this.selectionManager.clear();
         const data = this.level1DataPoints.length > 0 ? this.level1DataPoints : this.currentDataPoints;
         if (data.length > 0) {
             const state = this.buildRestoreState(1, "", data);
@@ -1236,7 +1337,7 @@ export class Visual implements IVisual {
         this.lastRenderedLevel = 2;
         this.currentDrillParentName = provinceName;
         this.previousDataKey = `2|${this.level2DataPoints.length}|${provinceName}`;
-        this.selectProvinceMulti(MapDataService.normalizeRegionName(provinceName));
+        await this.selectProvinceMulti(MapDataService.normalizeRegionName(provinceName));
         const state = this.buildRestoreState(2, provinceName, this.level2DataPoints);
         this.chart.clear();
         this.chart.setOption(this.buildEChartsOption(state), true);
