@@ -36,6 +36,16 @@
             "description": "鼠标悬停时显示的额外度量字段"
         }
     ],
+    "tooltips": {
+        "supportedTypes": {
+            "default": true,
+            "canvas": true
+        },
+        "roles": [
+            "tooltips"
+        ],
+        "supportEnhancedTooltips": true
+    },
     "objects": {
         "general": {
             "properties": {

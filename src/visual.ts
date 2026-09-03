@@ -22,6 +22,8 @@ import DataView = powerbi.DataView;
 import DataViewCategoryColumn = powerbi.DataViewCategoryColumn;
 import DataViewMetadataColumn = powerbi.DataViewMetadataColumn;
 import DataViewTable = powerbi.DataViewTable;
+import ITooltipService = powerbi.extensibility.ITooltipService;
+import VisualTooltipDataItem = powerbi.extensibility.VisualTooltipDataItem;
 
 /** 格式化配置提取接口 */
 interface MapFormatConfig {
@@ -51,6 +53,7 @@ export class Visual implements IVisual {
     private host: IVisualHost;
     private chart: echarts.ECharts | null = null;
     private selectionManager: ISelectionManager;
+    private tooltipService: ITooltipService;
     private formattingSettingsService: FormattingSettingsService;
     private formattingSettings: VisualFormattingSettingsModel;
     private mapDataService: MapDataService;
@@ -94,6 +97,7 @@ export class Visual implements IVisual {
         this.host = options.host;
         this.target = options.element;
         this.selectionManager = this.host.createSelectionManager();
+        this.tooltipService = this.host.tooltipService;
         this.selectionManager.registerOnSelectCallback((ids) => this.handleHostSelectionChanged(ids));
         this.formattingSettingsService = new FormattingSettingsService();
         this.mapDataService = new MapDataService();
@@ -711,31 +715,8 @@ export class Visual implements IVisual {
         };
 
         const option: any = {
-            tooltip: {
-                show: fmt.tooltipShow,
-                trigger: "item",
-                formatter: (params: any) => {
-                    const lines: string[] = [`<b>${params.name}</b>`];
-                    if (params.value != null && !isNaN(params.value)) {
-                        lines.push(`${this.getMeasureName()}: ${this.formatNumber(params.value)}`);
-                    }
-                    const dpIdx = params.data?._index;
-                    if (dpIdx != null && dpIdx < state.dataPoints.length) {
-                        const dp = state.dataPoints[dpIdx];
-                        if (dp.tooltips) {
-                            for (const tt of dp.tooltips) {
-                                if (tt.value && tt.value !== "undefined" && tt.value !== "null") {
-                                    lines.push(`${tt.displayName}: ${tt.value}`);
-                                }
-                            }
-                        }
-                    }
-                    if (lines.length === 1 && (params.value == null || isNaN(params.value))) {
-                        return `<b>${params.name}</b><br/>暂无数据`;
-                    }
-                    return lines.join("<br/>");
-                }
-            },
+            // 提示框交给 Power BI 宿主绘制，以支持报表页提示和“钻取”操作栏。
+            tooltip: { show: false },
             series: [seriesOption]
         };
 
@@ -902,6 +883,10 @@ export class Visual implements IVisual {
     private bindChartEvents(): void {
         if (!this.chart) return;
         this.chart.off("click");
+        this.chart.off("mouseover");
+        this.chart.off("mousemove");
+        this.chart.off("mouseout");
+        this.chart.off("globalout");
         this.chart.on("click", "series.map", (params: any) => {
             const dpIndex = params.data?._index ?? params.dataIndex;
             if (this.lastRenderedLevel <= 1) {
@@ -914,6 +899,72 @@ export class Visual implements IVisual {
                 }
             }
         });
+        this.chart.on("mouseover", "series.map", (params: any) => this.showHostTooltip(params));
+        this.chart.on("mousemove", "series.map", (params: any) => this.moveHostTooltip(params));
+        this.chart.on("mouseout", "series.map", () => this.hideHostTooltip(false));
+        this.chart.on("globalout", () => this.hideHostTooltip(false));
+    }
+
+    /**
+     * 使用 Power BI 原生 tooltip 服务。增强型 tooltip 会根据 identities 自动判断
+     * 当前数据点是否存在可用的钻取页面，并由宿主绘制操作栏。
+     */
+    private showHostTooltip(params: any): void {
+        if (!this.getFormatConfig().tooltipShow || !this.tooltipService.enabled()) return;
+        const dataPoint = this.getDataPointFromEvent(params);
+        const event = params?.event?.event as PointerEvent | undefined;
+        if (!dataPoint || !event) return;
+
+        this.tooltipService.show({
+            coordinates: [event.clientX, event.clientY],
+            isTouchEvent: event.pointerType === "touch",
+            dataItems: this.buildHostTooltipData(dataPoint),
+            identities: dataPoint.selectionId ? [dataPoint.selectionId] : []
+        });
+    }
+
+    private moveHostTooltip(params: any): void {
+        if (!this.getFormatConfig().tooltipShow || !this.tooltipService.enabled()) return;
+        const dataPoint = this.getDataPointFromEvent(params);
+        const event = params?.event?.event as PointerEvent | undefined;
+        if (!dataPoint || !event) return;
+
+        this.tooltipService.move({
+            coordinates: [event.clientX, event.clientY],
+            isTouchEvent: event.pointerType === "touch",
+            identities: dataPoint.selectionId ? [dataPoint.selectionId] : []
+        });
+    }
+
+    private hideHostTooltip(immediately: boolean): void {
+        if (!this.tooltipService.enabled()) return;
+        this.tooltipService.hide({ isTouchEvent: false, immediately });
+    }
+
+    private getDataPointFromEvent(params: any): DataPoint | undefined {
+        const index = params?.data?._index ?? params?.dataIndex;
+        return index != null && index >= 0 && index < this.currentDataPoints.length
+            ? this.currentDataPoints[index]
+            : undefined;
+    }
+
+    private buildHostTooltipData(dataPoint: DataPoint): VisualTooltipDataItem[] {
+        const dataItems: VisualTooltipDataItem[] = [{
+            displayName: this.getLevelLabel(this.lastRenderedLevel),
+            value: dataPoint.name
+        }];
+        if (dataPoint.value != null && !isNaN(dataPoint.value)) {
+            dataItems.push({
+                displayName: this.getMeasureName(),
+                value: this.formatNumber(dataPoint.value)
+            });
+        }
+        for (const tooltip of dataPoint.tooltips || []) {
+            if (tooltip.value && tooltip.value !== "undefined" && tooltip.value !== "null") {
+                dataItems.push({ displayName: tooltip.displayName, value: tooltip.value });
+            }
+        }
+        return dataItems;
     }
 
     /**
@@ -994,7 +1045,10 @@ export class Visual implements IVisual {
         let minVal = Infinity, maxVal = -Infinity;
         cityAgg.forEach((info, cityName) => {
             const sid = this.createRowSelectionId(info.firstIdx, 1);
-            cityDataPoints.push({ name: cityName, value: info.total, selectionId: sid });
+            const dataPoint: DataPoint = { name: cityName, value: info.total, selectionId: sid };
+            const tooltips = this.buildTooltipData([info.firstIdx])[0];
+            if (tooltips?.length) dataPoint.tooltips = tooltips;
+            cityDataPoints.push(dataPoint);
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
         });
@@ -1035,7 +1089,10 @@ export class Visual implements IVisual {
         let minVal = Infinity, maxVal = -Infinity;
         districtAgg.forEach((info, name) => {
             const sid = this.createRowSelectionId(info.firstIdx, 2);
-            districtDataPoints.push({ name, value: info.total, selectionId: sid });
+            const dataPoint: DataPoint = { name, value: info.total, selectionId: sid };
+            const tooltips = this.buildTooltipData([info.firstIdx])[0];
+            if (tooltips?.length) dataPoint.tooltips = tooltips;
+            districtDataPoints.push(dataPoint);
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
         });
@@ -1082,7 +1139,10 @@ export class Visual implements IVisual {
         let minVal = Infinity, maxVal = -Infinity;
         districtAgg.forEach((info, name) => {
             const sid = this.createRowSelectionId(info.firstIdx, 2);
-            districtDataPoints.push({ name, value: info.total, selectionId: sid });
+            const dataPoint: DataPoint = { name, value: info.total, selectionId: sid };
+            const tooltips = this.buildTooltipData([info.firstIdx])[0];
+            if (tooltips?.length) dataPoint.tooltips = tooltips;
+            districtDataPoints.push(dataPoint);
             minVal = Math.min(minVal, info.total);
             maxVal = Math.max(maxVal, info.total);
         });
