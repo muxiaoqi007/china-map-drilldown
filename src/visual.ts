@@ -44,6 +44,11 @@ interface MapFormatConfig {
     maxValue: number;
 }
 
+interface FilterTarget {
+    table: string;
+    column: string;
+}
+
 export class Visual implements IVisual {
     private target: HTMLElement;
     private chartContainer: HTMLElement;
@@ -87,6 +92,8 @@ export class Visual implements IVisual {
     private rawCatNames: string[][] = [];
     private rawMeasureValues: number[] = [];
     private rawTable: DataViewTable | null = null;
+    private provinceFilterTarget: FilterTarget | null = null;
+    private cityFilterTarget: FilterTarget | null = null;
 
     private tooltipColumns: Array<{ displayName: string; values: any[]; formatString: string }> = [];
     private measureDisplayName: string = "数值";
@@ -228,6 +235,10 @@ export class Visual implements IVisual {
             }
             this.rawCatNames.push(names);
         }
+        const provinceCategory = categories.find((category) => !!category.source.roles?.province);
+        const cityCategory = categories.find((category) => !!category.source.roles?.city);
+        this.provinceFilterTarget = this.createFilterTarget(provinceCategory?.source);
+        this.cityFilterTarget = this.createFilterTarget(cityCategory?.source);
 
         // 提取度量值 (values[0])
         const measureSource = values[0]?.source || values[0]?.values?.[0]?.source;
@@ -321,6 +332,8 @@ export class Visual implements IVisual {
 
         this.rawTable = table;
         this.rawCatColumns = [];
+        this.provinceFilterTarget = this.createFilterTarget(columns[provinceIndex]);
+        this.cityFilterTarget = cityIndex >= 0 ? this.createFilterTarget(columns[cityIndex]) : null;
         this.updateMeasureMetadata(columns[measureIndex]);
         const provinceNames = rows.map((row) => String(row[provinceIndex] ?? ""));
         const cityNames = cityIndex >= 0 ? rows.map((row) => String(row[cityIndex] ?? "")) : [];
@@ -1056,11 +1069,12 @@ export class Visual implements IVisual {
 
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
+        // 尽早通知 Power BI 联动，让其他视觉的查询与地图加载/渲染并行执行。
+        const linkagePromise = this.selectProvinceMulti(normProvince);
         this.currentDrillProvinceName = provinceName;
         this.currentDrillProvinceAdcode = adcode;
         await this.loadAndRenderDrillMap(adcode, provinceName, 2, cityDataPoints, minVal, maxVal);
-        // 联动表格：多选该省全部数据行，使表格过滤到整个省（数据指纹守卫保证地图不受影响）
-        await this.selectProvinceMulti(normProvince);
+        await linkagePromise;
     }
 
     /**
@@ -1100,14 +1114,15 @@ export class Visual implements IVisual {
 
         const adcode = await this.resolveAdcode(provinceName);
         if (!adcode) return;
+        // 先发出联动请求，避免其他视觉等待区县地图完成渲染后才开始查询。
+        const linkagePromise = this.selectProvinceMulti(normProvince);
         // 直辖市无地级层，面包屑的"省份"层即该直辖市本身
         this.level2ParentName = provinceName;
         this.currentDrillProvinceName = provinceName;
         this.currentDrillProvinceAdcode = adcode;
         this.currentDrillIsMunicipality = true;
         await this.loadAndRenderDrillMap(adcode, provinceName, 3, districtDataPoints, minVal, maxVal);
-        // 联动表格：多选该直辖市全部数据行
-        await this.selectProvinceMulti(normProvince);
+        await linkagePromise;
     }
 
     private async drillDownToCity(cityName: string): Promise<void> {
@@ -1154,11 +1169,12 @@ export class Visual implements IVisual {
             await this.crossFilter(cityName);
             return;
         }
+        // 先发出联动请求，地图资源解析和渲染不再阻塞其他视觉开始刷新。
+        const linkagePromise = this.selectCityMulti(cityName);
         this.currentDrillIsMunicipality = false;
         this.currentDrillProvinceName = this.findProvinceOfCity(cityName) || this.currentDrillProvinceName;
         await this.loadAndRenderDrillMap(adcode, cityName, 3, districtDataPoints, minVal, maxVal);
-        // 联动表格：多选该市全部数据行，使表格过滤到整个市
-        await this.selectCityMulti(cityName);
+        await linkagePromise;
     }
 
     private async crossFilter(name: string): Promise<void> {
@@ -1172,6 +1188,11 @@ export class Visual implements IVisual {
     private async selectProvinceMulti(normProvince: string): Promise<void> {
         if (this.rawCatNames.length < 1) return;
         const provinceNames = this.rawCatNames[0];
+        const provinceName = provinceNames.find(
+            (name) => MapDataService.normalizeRegionName(name) === normProvince
+        );
+        if (provinceName && await this.applyHierarchyFilter(provinceName)) return;
+
         const ids: powerbi.visuals.ISelectionId[] = [];
         for (let i = 0; i < provinceNames.length; i++) {
             if (MapDataService.normalizeRegionName(provinceNames[i]) !== normProvince) continue;
@@ -1186,6 +1207,14 @@ export class Visual implements IVisual {
         if (this.rawCatNames.length < 2) return;
         const cityNames = this.rawCatNames[1];
         const normCity = MapDataService.normalizeRegionName(cityName);
+        const cityIndex = cityNames.findIndex(
+            (name) => MapDataService.normalizeRegionName(name) === normCity
+        );
+        if (cityIndex >= 0) {
+            const provinceName = this.rawCatNames[0]?.[cityIndex];
+            if (provinceName && await this.applyHierarchyFilter(provinceName, cityNames[cityIndex])) return;
+        }
+
         const ids: powerbi.visuals.ISelectionId[] = [];
         for (let i = 0; i < cityNames.length; i++) {
             if (MapDataService.normalizeRegionName(cityNames[i]) !== normCity) continue;
@@ -1193,6 +1222,62 @@ export class Visual implements IVisual {
             if (id) ids.push(id);
         }
         await this.applyDrillSelection(ids);
+    }
+
+    /**
+     * 用一到两个字段过滤条件替代按明细行批量多选。
+     * 对大省份而言，宿主需要处理的身份数量由明细行数降为常量级。
+     */
+    private async applyHierarchyFilter(provinceName: string, cityName?: string): Promise<boolean> {
+        if (!this.provinceFilterTarget || (cityName && !this.cityFilterTarget)) return false;
+
+        const filters: any[] = [this.createBasicFilter(this.provinceFilterTarget, provinceName)];
+        if (cityName && this.cityFilterTarget) {
+            filters.push(this.createBasicFilter(this.cityFilterTarget, cityName));
+        }
+
+        this.applyingDrillSelection = true;
+        try {
+            if (this.selectionManager.getSelectionIds().length > 0) {
+                await this.selectionManager.clear();
+            }
+            this.drillSelectionActive = false;
+            this.host.applyJsonFilter(filters, "general", "filter", powerbi.FilterAction.merge);
+            return true;
+        } catch (error) {
+            console.warn("[ChinaMap] 应用层级过滤失败，回退到行选择:", error);
+            return false;
+        } finally {
+            this.applyingDrillSelection = false;
+        }
+    }
+
+    private createBasicFilter(target: FilterTarget, value: string): any {
+        return {
+            $schema: "https://powerbi.com/product/schema#basic",
+            filterType: 1,
+            target,
+            operator: "In",
+            values: [value]
+        };
+    }
+
+    /** 从 Power BI queryName 提取 Basic Filter 所需的表名和列名。 */
+    private createFilterTarget(column?: DataViewMetadataColumn): FilterTarget | null {
+        const queryName = column?.queryName?.trim();
+        if (!queryName) return null;
+
+        const bracketMatch = queryName.match(/^'?(.+?)'?\[([^\]]+)\]$/);
+        if (bracketMatch) {
+            return { table: bracketMatch[1].replace(/^'|'$/g, ""), column: bracketMatch[2] };
+        }
+
+        const separator = queryName.lastIndexOf(".");
+        if (separator <= 0 || separator >= queryName.length - 1) return null;
+        return {
+            table: queryName.slice(0, separator).replace(/^'|'$/g, ""),
+            column: queryName.slice(separator + 1).replace(/^\[|\]$/g, "")
+        };
     }
 
     /** 应用下钻联动并记录选择状态，用于识别 Power BI 视觉对象头的“清除选择”。 */
@@ -1388,6 +1473,7 @@ export class Visual implements IVisual {
         this.resetDrillTracking();
         this.lastRenderedLevel = 1;
         void this.selectionManager.clear();
+        this.host.applyJsonFilter(null, "general", "filter", powerbi.FilterAction.remove);
         const data = this.level1DataPoints.length > 0 ? this.level1DataPoints : this.currentDataPoints;
         if (data.length > 0) {
             const state = this.buildRestoreState(1, "", data);
