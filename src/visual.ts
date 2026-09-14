@@ -148,8 +148,13 @@ export class Visual implements IVisual {
             this.formattingSettings = this.formattingSettingsService
                 .populateFormattingSettingsModel(VisualFormattingSettingsModel, dataView);
 
-            if (options.type & powerbi.VisualUpdateType.Resize
-                || options.type & powerbi.VisualUpdateType.ResizeEnd) {
+            // Resize 可能与 Data 一起到达（尤其是 Service/世纪互联首次加载）。
+            // 只有纯尺寸更新才跳过数据解析；否则首次更新会直接 return，地图保持空白。
+            const isDataUpdate = (options.type & powerbi.VisualUpdateType.Data) !== 0;
+            const isResizeOnly = !isDataUpdate
+                && ((options.type & powerbi.VisualUpdateType.Resize) !== 0
+                    || (options.type & powerbi.VisualUpdateType.ResizeEnd) !== 0);
+            if (isResizeOnly) {
                 return;
             }
 
