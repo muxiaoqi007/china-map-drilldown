@@ -5,7 +5,6 @@
  */
 
 // ── 打包的本地 GeoJSON 数据（用 require 确保 webpack 兼容）──
-/* eslint-disable @typescript-eslint/no-var-requires */
 declare const require: (module: string) => any;
 const chinaGeo = require("./assets/china.json");
 const guangdongGeo = require("./assets/guangdong.json");
@@ -68,6 +67,8 @@ export interface DataPoint {
     value: number;
     /** Power BI 选择标识（用于交互） */
     selectionId?: powerbi.visuals.ISelectionId;
+    /** Source rows for additive groups; identities are built only when selected. */
+    rowIndices?: number[];
     /** 工具提示字段 */
     tooltips?: Array<{ displayName: string; value: string }>;
 }
@@ -350,14 +351,18 @@ export class MapDataService {
     private async fetchJSON(url: string): Promise<any> {
         // 优先使用 fetch
         if (typeof fetch === "function") {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
             try {
-                const response = await fetch(url);
+                const response = await fetch(url, { signal: controller.signal, credentials: "omit" });
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
                 return await response.json();
             } catch (fetchErr) {
                 console.warn("[MapData] fetch 失败，尝试 XHR 回退:", fetchErr.message);
+            } finally {
+                clearTimeout(timeout);
             }
         }
 

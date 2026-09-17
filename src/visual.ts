@@ -12,6 +12,7 @@ import { valueFormatter } from "powerbi-visuals-utils-formattingutils";
 import { MapDataService, DrillState, DataPoint } from "./mapDataService";
 import { VisualFormattingSettingsModel } from "./settings";
 import "./../style/visual.less";
+import { numericValue, addValues } from "./numeric";
 
 import VisualConstructorOptions = powerbi.extensibility.visual.VisualConstructorOptions;
 import VisualUpdateOptions = powerbi.extensibility.visual.VisualUpdateOptions;
@@ -63,6 +64,14 @@ export class Visual implements IVisual {
     private formattingSettings: VisualFormattingSettingsModel;
     private mapDataService: MapDataService;
 
+    private destroyed = false;
+    private renderRevision = 0;
+    private formatFingerprint = "";
+    private currentState: DrillState | null = null;
+    private lastContextEvent: Event | null = null;
+    /** Explicit toggle state for leaf filters at all three levels. */
+    private leafFilterKey: string = "";
+    private activeFilterDepth: number = 0;
     private currentAdcode: string = MapDataService.CHINA_ADCODE;
     private currentMapName: string = "china";
     private registeredMaps: Set<string> = new Set();
@@ -94,6 +103,7 @@ export class Visual implements IVisual {
     private rawTable: DataViewTable | null = null;
     private provinceFilterTarget: FilterTarget | null = null;
     private cityFilterTarget: FilterTarget | null = null;
+    private districtFilterTarget: FilterTarget | null = null;
 
     private tooltipColumns: Array<{ displayName: string; values: any[]; formatString: string }> = [];
     private measureDisplayName: string = "数值";
@@ -126,86 +136,133 @@ export class Visual implements IVisual {
         // SVG 渲染器：兼容 Power BI Service CSP
         this.chart = echarts.init(this.chartElement, null, { renderer: "svg" });
         window.addEventListener("resize", this.handleResize);
+        this.target.addEventListener("contextmenu", this.handleEmptyContextMenu);
     }
 
     public update(options: VisualUpdateOptions): void {
-        try {
-            this.lastUpdateOptions = options;
-
-            // 始终用 viewport 设置容器尺寸
-            if (options.viewport) {
-                const { width, height } = options.viewport;
-                this.chartElement.style.width = `${width}px`;
-                this.chartElement.style.height = `${height}px`;
-                if (this.chart) {
-                    this.chart.resize({ width, height });
-                }
+        this.host.eventService.renderingStarted(options);
+        void this.updateView(options).then(
+            () => this.host.eventService.renderingFinished(options),
+            (error) => {
+                if (!this.destroyed) this.showOverlay(`渲染出错: ${String(error.message || error)}`, true);
+                this.host.eventService.renderingFailed(options, String(error.message || error));
             }
+        );
+    }
 
-            const dataView = options.dataViews?.[0];
-            if (!dataView) return;
+    private async updateView(options: VisualUpdateOptions): Promise<void> {
+        this.lastUpdateOptions = options;
 
-            this.formattingSettings = this.formattingSettingsService
-                .populateFormattingSettingsModel(VisualFormattingSettingsModel, dataView);
-
-            // Resize 可能与 Data 一起到达（尤其是 Service/世纪互联首次加载）。
-            // 只有纯尺寸更新才跳过数据解析；否则首次更新会直接 return，地图保持空白。
-            const isDataUpdate = (options.type & powerbi.VisualUpdateType.Data) !== 0;
-            const isResizeOnly = !isDataUpdate
-                && ((options.type & powerbi.VisualUpdateType.Resize) !== 0
-                    || (options.type & powerbi.VisualUpdateType.ResizeEnd) !== 0);
-            if (isResizeOnly) {
-                return;
+        // 始终用 viewport 设置容器尺寸
+        if (options.viewport) {
+            const { width, height } = options.viewport;
+            this.chartElement.style.width = `${width}px`;
+            this.chartElement.style.height = `${height}px`;
+            if (this.chart) {
+                this.chart.resize({ width, height });
             }
-
-            const parsedData = this.parseDataView(dataView);
-            if (!parsedData || parsedData.dataPoints.length === 0) {
-                this.showOverlay("请将省份字段拖入数据角色以开始");
-                return;
-            }
-
-            // 数据指纹：底层数据未变化时跳过重绘，保住内部下钻状态
-            // （Power BI 在内部下钻后会重复发送全量数据，若不跳过会把省级地图重置回全国）
-            const fingerprint = this.buildDataFingerprint(parsedData);
-            const selectionWasCleared = this.drillSelectionActive
-                && this.lastRenderedLevel >= 2
-                && this.selectionManager.getSelectionIds().length === 0;
-
-            // 用户取消城市/区县选中时，保留当前下钻地图，并恢复父级区域联动。
-            // 例如地图仍在黑龙江省时，右侧表格应恢复为“黑龙江省”，而不是全国。
-            if (selectionWasCleared) {
-                void this.restoreCurrentLevelLinkage();
-                return;
-            } else if (fingerprint === this.dataFingerprint && this.lastRenderedLevel >= 2) {
-                return;
-            }
-            this.dataFingerprint = fingerprint;
-
-            const dataKey = `${parsedData.level}|${parsedData.dataPoints.length}|${parsedData.parentName}`;
-            if (dataKey !== this.previousDataKey) {
-                if (parsedData.level <= 1 && this.lastRenderedLevel >= 2) {
-                    this.resetDrillTracking();
-                    void this.selectionManager.clear();
-                }
-                this.previousDataKey = dataKey;
-            }
-
-            this.lastRenderedLevel = parsedData.level;
-            this.renderMap(parsedData);
-        } catch (error) {
-            console.error("[ChinaMap] update error:", error);
-            this.showOverlay(`渲染出错: ${error.message || error}`, true);
         }
+
+        const dataView = options.dataViews?.[0];
+        if (!dataView) {
+            this.clearDataView();
+            return;
+        }
+
+        this.formattingSettings = this.formattingSettingsService
+            .populateFormattingSettingsModel(VisualFormattingSettingsModel, dataView);
+
+        const formatFingerprint = JSON.stringify([this.getFormatConfig(), dataView.metadata?.objects]);
+        const formatChanged = formatFingerprint !== this.formatFingerprint;
+        this.formatFingerprint = formatFingerprint;
+        if (dataView.metadata?.segment) {
+            this.clearDataView();
+            this.showOverlay("数据未完整加载，请减少区域数量或添加筛选条件。", true);
+            return;
+        }
+
+        // Resize 可能与 Data 一起到达（尤其是 Service/世纪互联首次加载）。
+        // 只有纯尺寸更新才跳过数据解析；否则首次更新会直接 return，地图保持空白。
+        const isDataUpdate = (options.type & powerbi.VisualUpdateType.Data) !== 0;
+        const isResizeOnly = !isDataUpdate
+            && ((options.type & powerbi.VisualUpdateType.Resize) !== 0
+                || (options.type & powerbi.VisualUpdateType.ResizeEnd) !== 0);
+        if (isResizeOnly && !formatChanged) {
+            return;
+        }
+
+        const parsedData = this.parseDataView(dataView);
+        if (!parsedData || parsedData.dataPoints.length === 0) {
+            this.clearDataView();
+            return;
+        }
+
+        // 数据指纹：底层数据未变化时跳过重绘，保住内部下钻状态
+        // （Power BI 在内部下钻后会重复发送全量数据，若不跳过会把省级地图重置回全国）
+        const fingerprint = this.buildDataFingerprint(parsedData);
+        const selectionWasCleared = this.drillSelectionActive
+            && !this.applyingDrillSelection
+            && this.lastRenderedLevel >= 2
+            && this.selectionManager.getSelectionIds().length === 0;
+
+        // 用户取消城市/区县选中时，保留当前下钻地图，并恢复父级区域联动。
+        // 例如地图仍在黑龙江省时，右侧表格应恢复为“黑龙江省”，而不是全国。
+        if (selectionWasCleared) {
+            await this.restoreCurrentLevelLinkage();
+            if (formatChanged) this.refreshCurrentMap();
+            return;
+        } else if (fingerprint === this.dataFingerprint && this.lastRenderedLevel >= 2) {
+            if (formatChanged) this.refreshCurrentMap();
+            return;
+        }
+        this.dataFingerprint = fingerprint;
+
+        const dataKey = `${parsedData.level}|${parsedData.dataPoints.length}|${parsedData.parentName}`;
+        if (dataKey !== this.previousDataKey) {
+            if (parsedData.level <= 1 && this.lastRenderedLevel >= 2) {
+                this.resetDrillTracking();
+                void this.selectionManager.clear();
+            }
+            this.previousDataKey = dataKey;
+        }
+
+        this.lastRenderedLevel = parsedData.level;
+        await this.renderMap(parsedData);
+    }
+
+
+    private refreshCurrentMap(): void {
+        if (!this.chart || !this.currentState) return;
+        this.hideHostTooltip(true);
+        this.chart.setOption(this.buildEChartsOption(this.currentState), true);
+        this.updateBreadcrumb(this.currentState);
+    }
+
+    private clearDataView(): void {
+        this.renderRevision++;
+        this.chart?.clear();
+        this.hideHostTooltip(true);
+        this.currentState = null;
+        this.currentDataPoints = [];
+        this.level1DataPoints = [];
+        this.rawCatNames = [];
+        this.rawMeasureValues = [];
+        this.rawTable = null;
+        this.resetDrillTracking();
+        this.showOverlay("请添加省份和数值字段。多层级仅支持销售额、数量等可加总指标。");
     }
 
     public destroy(): void {
+        this.destroyed = true;
+        this.renderRevision++;
+        this.target.removeEventListener("contextmenu", this.handleEmptyContextMenu);
         window.removeEventListener("resize", this.handleResize);
         this.chart?.dispose();
         this.chart = null;
     }
 
     public getFormattingModel(): powerbi.visuals.FormattingModel {
-        return this.formattingSettingsService.buildFormattingModel(this.formattingSettings);
+        return this.formattingSettingsService.buildFormattingModel(this.formattingSettings || new VisualFormattingSettingsModel());
     }
 
     /* ═══ 数据解析 ═══ */
@@ -244,6 +301,7 @@ export class Visual implements IVisual {
         const cityCategory = categories.find((category) => !!category.source.roles?.city);
         this.provinceFilterTarget = this.createFilterTarget(provinceCategory?.source);
         this.cityFilterTarget = this.createFilterTarget(cityCategory?.source);
+        this.districtFilterTarget = this.createFilterTarget(categories.find(category => !!category.source.roles?.district)?.source);
 
         // 提取度量值 (values[0])
         const measureSource = values[0]?.source || values[0]?.values?.[0]?.source;
@@ -339,6 +397,7 @@ export class Visual implements IVisual {
         this.rawCatColumns = [];
         this.provinceFilterTarget = this.createFilterTarget(columns[provinceIndex]);
         this.cityFilterTarget = cityIndex >= 0 ? this.createFilterTarget(columns[cityIndex]) : null;
+        this.districtFilterTarget = districtIndex >= 0 ? this.createFilterTarget(columns[districtIndex]) : null;
         this.updateMeasureMetadata(columns[measureIndex]);
         const provinceNames = rows.map((row) => String(row[provinceIndex] ?? ""));
         const cityNames = cityIndex >= 0 ? rows.map((row) => String(row[cityIndex] ?? "")) : [];
@@ -346,7 +405,7 @@ export class Visual implements IVisual {
         this.rawCatNames = [provinceNames];
         if (cityIndex >= 0) this.rawCatNames.push(cityNames);
         if (districtIndex >= 0) this.rawCatNames.push(districtNames);
-        this.rawMeasureValues = rows.map((row) => Number(row[measureIndex] ?? 0));
+        this.rawMeasureValues = rows.map((row) => numericValue(row[measureIndex]));
 
         this.tooltipColumns = [];
         for (let ci = 0; ci < columns.length; ci++) {
@@ -375,20 +434,19 @@ export class Visual implements IVisual {
     }
 
     private buildTableDrillState(level: number, parentName: string, names: string[]): DrillState {
-        const grouped = new Map<string, { name: string; total: number; firstIdx: number }>();
+        const grouped = new Map<string, { name: string; total: number; firstIdx: number; indices: number[] }>();
         for (let i = 0; i < names.length; i++) {
-            const value = this.rawMeasureValues[i] ?? 0;
-            if (isNaN(value)) continue;
+            const value = this.rawMeasureValues[i] ?? NaN;
             const normalized = MapDataService.normalizeRegionName(names[i]);
             const key = normalized || names[i];
             const existing = grouped.get(key);
             if (existing) {
-                existing.total += value;
+                existing.total = addValues(existing.total, value); existing.indices.push(i);
             } else {
                 grouped.set(key, {
                     name: names[i],
                     total: value,
-                    firstIdx: i
+                    firstIdx: i, indices: [i]
                 });
             }
         }
@@ -400,13 +458,14 @@ export class Visual implements IVisual {
             const dp: DataPoint = {
                 name: item.name,
                 value: item.total,
-                selectionId: this.createRowSelectionId(item.firstIdx, Math.max(0, level - 1))
+                selectionId: this.createRowSelectionId(item.firstIdx, Math.max(0, level - 1)),
+                rowIndices: item.indices
             };
-            const tooltips = this.buildTooltipData([item.firstIdx])[0];
+            const tooltips = this.buildAggregateTooltip(item.indices);
             if (tooltips?.length) dp.tooltips = tooltips;
             dataPoints.push(dp);
-            minValue = Math.min(minValue, item.total);
-            maxValue = Math.max(maxValue, item.total);
+            if (Number.isFinite(item.total)) minValue = Math.min(minValue, item.total);
+            if (Number.isFinite(item.total)) maxValue = Math.max(maxValue, item.total);
         });
 
         // 含单数据点：min==max 时扩展范围，避免 visualMap 退化导致全图同色
@@ -430,11 +489,11 @@ export class Visual implements IVisual {
             const rawVals = valCol.values;
             const idxMap = valCol.identityFrom?.map;
             if (Array.isArray(idxMap) && idxMap.length > 0) {
-                const mappedResult = new Array(rowCount).fill(0);
+                const mappedResult = new Array(rowCount).fill(NaN);
                 for (let i = 0; i < rawVals.length; i++) {
                     const row = idxMap[i];
                     if (typeof row === "number" && row >= 0 && row < rowCount) {
-                        mappedResult[row] += Number(rawVals[i] ?? 0);
+                        mappedResult[row] = addValues(mappedResult[row], numericValue(rawVals[i]));
                     }
                 }
                 return mappedResult;
@@ -442,13 +501,13 @@ export class Visual implements IVisual {
 
             const result: number[] = [];
             for (let i = 0; i < rawVals.length; i++) {
-                result.push(Number(rawVals[i] ?? 0));
+                result.push(numericValue(rawVals[i]));
             }
             return result;
         }
 
         // 分组模式：按分组的 identity 归并到对应的省份行
-        const flatValues = new Array(rowCount).fill(0);
+        const flatValues = new Array(rowCount).fill(NaN);
 
         // 构建省份行 identity → 行索引 的映射
         const identityToRow = new Map<string, number>();
@@ -467,11 +526,11 @@ export class Visual implements IVisual {
         }
 
         const sumGroup = (g: any): number => {
-            let s = 0;
+            let s = NaN;
             const inner = Array.isArray(g?.values) ? g.values : [];
             for (const m of inner) {
                 const arr = Array.isArray(m?.values) ? m.values : (Array.isArray(m) ? m : []);
-                for (const v of arr) s += Number(v ?? 0);
+                for (const v of arr) s = addValues(s, numericValue(v));
             }
             return s;
         };
@@ -500,13 +559,13 @@ export class Visual implements IVisual {
             const idxMap: number[] = valCol.identityFrom.map;
             for (let j = 0; j < mappedValues.length; j++) {
                 const idx = idxMap[j];
-                if (idx != null && idx < rowCount) flatValues[idx] += Number(mappedValues[j] ?? 0);
+                if (idx != null && idx < rowCount) flatValues[idx] = addValues(flatValues[idx], numericValue(mappedValues[j]));
             }
         } else if (Array.isArray(valCol.values)) {
             for (let gi = 0; gi < valCol.values.length; gi++) {
                 const g = valCol.values[gi];
                 const row = groupToRow(g, gi);
-                if (row >= 0 && row < rowCount) flatValues[row] += sumGroup(g);
+                if (row >= 0 && row < rowCount) flatValues[row] = addValues(flatValues[row], sumGroup(g));
             }
         }
 
@@ -527,14 +586,14 @@ export class Visual implements IVisual {
     private aggregateByCategory(
         names: string[], values: number[], category: DataViewCategoryColumn
     ): { category: DataViewCategoryColumn; values: number[]; firstIndices: number[] } {
-        const seen = new Map<string, { total: number; firstIdx: number }>();
+        const seen = new Map<string, { total: number; firstIdx: number; indices: number[] }>();
         for (let i = 0; i < names.length; i++) {
             const name = names[i];
             const existing = seen.get(name);
             if (existing) {
-                existing.total += (values[i] ?? 0);
+                existing.total = addValues(existing.total, values[i]); existing.indices.push(i);
             } else {
-                seen.set(name, { total: values[i] ?? 0, firstIdx: i });
+                seen.set(name, { total: values[i] ?? NaN, firstIdx: i, indices: [i] });
             }
         }
         const uniqueNames: string[] = [];
@@ -561,15 +620,14 @@ export class Visual implements IVisual {
         let minValue = Infinity, maxValue = -Infinity;
         for (let i = 0; i < category.values.length; i++) {
             const name = String(category.values[i] ?? "");
-            const value = measureValues[i] ?? 0;
-            if (isNaN(value)) continue;
+            const value = measureValues[i] ?? NaN;
             const selectionId = this.host.createSelectionIdBuilder()
                 .withCategory(category, i).createSelectionId();
             const dp: DataPoint = { name, value, selectionId };
             if (tooltipData && i < tooltipData.length) dp.tooltips = tooltipData[i];
             dataPoints.push(dp);
-            minValue = Math.min(minValue, value);
-            maxValue = Math.max(maxValue, value);
+            if (Number.isFinite(value)) minValue = Math.min(minValue, value);
+            if (Number.isFinite(value)) maxValue = Math.max(maxValue, value);
         }
         // 含单数据点：min==max 时扩展范围，避免 visualMap 退化导致全图同色
         [minValue, maxValue] = this.expandDegenerateRange(minValue, maxValue);
@@ -580,6 +638,13 @@ export class Visual implements IVisual {
             mapName: this.getMapName(level, primaryName),
             dataPoints, minValue, maxValue
         };
+    }
+
+    private buildAggregateTooltip(indices: number[]): Array<{ displayName: string; value: string }> {
+        return this.tooltipColumns.map((column) => {
+            const total = indices.reduce((sum, index) => addValues(sum, numericValue(column.values[index])), NaN);
+            return { displayName: column.displayName, value: Number.isFinite(total) ? this.formatValue(total, column.formatString) : "无数据" };
+        });
     }
 
     private buildTooltipData(rowIndices: number[]): Array<Array<{ displayName: string; value: string }>> {
@@ -633,6 +698,7 @@ export class Visual implements IVisual {
 
     private async renderMap(drillState: DrillState): Promise<void> {
         if (!this.chart) return;
+        const revision = ++this.renderRevision;
 
         let targetAdcode: string;
         if (drillState.level <= 1) {
@@ -663,8 +729,8 @@ export class Visual implements IVisual {
 
         if (needsReload) {
             this.showLoading();
-            try {
                 let geoJson = await this.mapDataService.getGeoJSON(targetAdcode);
+                if (revision !== this.renderRevision || !this.chart) return;
                 if (useInset) {
                     const scsResult = MapDataService.filterSouthChinaSea(geoJson);
                     geoJson = scsResult.cleanedGeoJson;
@@ -683,12 +749,9 @@ export class Visual implements IVisual {
                 }
                 this.currentAdcode = targetAdcode;
                 this.currentMapName = mapName;
-            } catch (error) {
-                this.showOverlay(`加载地图数据失败: ${error.message}`, true);
-                return;
-            }
         }
 
+        if (revision !== this.renderRevision || !this.chart) return;
         this.currentDataPoints = drillState.dataPoints;
         if (drillState.level <= 1) {
             this.level1DataPoints = drillState.dataPoints;
@@ -708,6 +771,8 @@ export class Visual implements IVisual {
     }
 
     private buildEChartsOption(state: DrillState): echarts.EChartsOption {
+        this.currentState = state;
+        this.currentDataPoints = state.dataPoints;
         const fmt = this.getFormatConfig();
         const mapData = this.buildMapData(state.dataPoints);
 
@@ -734,11 +799,12 @@ export class Visual implements IVisual {
 
         const option: any = {
             // 提示框交给 Power BI 宿主绘制，以支持报表页提示和“钻取”操作栏。
+            animation: false,
             tooltip: { show: false },
             series: [seriesOption]
         };
 
-        if (fmt.showLegend) {
+        {
             // 范围无效（相等或颠倒）时回退自动范围，避免 visualMap 退化导致全图同色或颜色颠倒
             let vmMin = fmt.minValue || state.minValue;
             let vmMax = fmt.maxValue || state.maxValue;
@@ -747,6 +813,7 @@ export class Visual implements IVisual {
                 vmMax = state.maxValue;
             }
             option.visualMap = {
+                show: fmt.showLegend,
                 type: "continuous",
                 min: vmMin,
                 max: vmMax,
@@ -777,7 +844,7 @@ export class Visual implements IVisual {
 
     private formatLabel(params: any, fmt: MapFormatConfig): string {
         // 无数据区域 ECharts 传入 NaN，不能显示成 "0"，回退为区域名称
-        const hasValue = params.value != null && !isNaN(params.value);
+        const hasValue = params.value != null && Number.isFinite(params.value);
         switch (fmt.labelContent) {
             case "value":
                 return hasValue ? this.formatNumber(params.value) : params.name;
@@ -900,13 +967,25 @@ export class Visual implements IVisual {
 
     private bindChartEvents(): void {
         if (!this.chart) return;
+        this.chart.off("contextmenu");
+        this.chart.on("contextmenu", "series.map", (params: any) => {
+            const event = params?.event?.event as MouseEvent;
+            if (!event) return;
+            this.lastContextEvent = event;
+            event.preventDefault();
+            const point = this.getDataPointFromEvent(params);
+            const identity = point?.rowIndices?.length > 1 ? undefined : point?.selectionId;
+            void this.selectionManager.showContextMenu(identity || {} as powerbi.visuals.ISelectionId,
+                { x: event.clientX, y: event.clientY });
+        });
         this.chart.off("click");
         this.chart.off("mouseover");
         this.chart.off("mousemove");
         this.chart.off("mouseout");
         this.chart.off("globalout");
         this.chart.on("click", "series.map", (params: any) => {
-            const dpIndex = params.data?._index ?? params.dataIndex;
+            if (this.host.hostCapabilities?.allowInteractions === false) return;
+            const dpIndex = params.data?._index;
             if (this.lastRenderedLevel <= 1) {
                 if (params.name) this.drillDownToProvince(params.name);
             } else if (this.lastRenderedLevel === 2) {
@@ -937,7 +1016,7 @@ export class Visual implements IVisual {
             coordinates: [event.clientX, event.clientY],
             isTouchEvent: event.pointerType === "touch",
             dataItems: this.buildHostTooltipData(dataPoint),
-            identities: dataPoint.selectionId ? [dataPoint.selectionId] : []
+            identities: dataPoint.selectionId && !(dataPoint.rowIndices?.length > 1) && this.lastRenderedLevel >= this.rawCatNames.length ? [dataPoint.selectionId] : []
         });
     }
 
@@ -950,7 +1029,7 @@ export class Visual implements IVisual {
         this.tooltipService.move({
             coordinates: [event.clientX, event.clientY],
             isTouchEvent: event.pointerType === "touch",
-            identities: dataPoint.selectionId ? [dataPoint.selectionId] : []
+            identities: dataPoint.selectionId && !(dataPoint.rowIndices?.length > 1) && this.lastRenderedLevel >= this.rawCatNames.length ? [dataPoint.selectionId] : []
         });
     }
 
@@ -960,7 +1039,7 @@ export class Visual implements IVisual {
     }
 
     private getDataPointFromEvent(params: any): DataPoint | undefined {
-        const index = params?.data?._index ?? params?.dataIndex;
+        const index = params?.data?._index;
         return index != null && index >= 0 && index < this.currentDataPoints.length
             ? this.currentDataPoints[index]
             : undefined;
@@ -971,7 +1050,7 @@ export class Visual implements IVisual {
             displayName: this.getLevelLabel(this.lastRenderedLevel),
             value: dataPoint.name
         }];
-        if (dataPoint.value != null && !isNaN(dataPoint.value)) {
+        if (dataPoint.value != null && Number.isFinite(dataPoint.value)) {
             dataItems.push({
                 displayName: this.getMeasureName(),
                 value: this.formatNumber(dataPoint.value)
@@ -991,11 +1070,17 @@ export class Visual implements IVisual {
      * 避免其他图表跳回全国数据。
      */
     private async handleLeafClick(dp: DataPoint): Promise<void> {
+        if (await this.applyLeafRegionFilter(dp)) return;
         if (!dp.selectionId) return;
         let selectedIds: powerbi.extensibility.ISelectionId[] = [];
         this.applyingDrillSelection = true;
         try {
-            selectedIds = await this.selectionManager.select(dp.selectionId);
+            // Preserve the original scalar identity for a single region. Only genuinely
+            // grouped rows need an array, with replacement (not additive) selection.
+            const ids = dp.rowIndices && dp.rowIndices.length > 1
+                ? dp.rowIndices.map(index => this.createRowSelectionId(index, this.lastRenderedLevel - 1)).filter(Boolean)
+                : null;
+            selectedIds = await this.selectionManager.select(ids || dp.selectionId, false);
             this.drillSelectionActive = selectedIds.length > 0;
         } finally {
             this.applyingDrillSelection = false;
@@ -1003,6 +1088,36 @@ export class Visual implements IVisual {
         if (!this.drillSelectionActive) {
             await this.restoreCurrentLevelLinkage();
         }
+    }
+
+    /** All leaf levels use field filters, including province + city + district. */
+    private async applyLeafRegionFilter(dp: DataPoint): Promise<boolean> {
+        const level = this.lastRenderedLevel;
+        if (level !== this.rawCatNames.length || level > 3 || level < 1) return false;
+        if (!this.provinceFilterTarget || (level >= 2 && !this.cityFilterTarget)
+            || (level === 3 && !this.districtFilterTarget)) return false;
+        const row = dp.rowIndices?.[0] ?? this.rawCatNames[level - 1].findIndex(
+            name => MapDataService.normalizeRegionName(name) === MapDataService.normalizeRegionName(dp.name)
+        );
+        const province = this.rawCatNames[0]?.[row];
+        const city = level >= 2 ? this.rawCatNames[1]?.[row] : undefined;
+        const district = level === 3 ? this.rawCatNames[2]?.[row] : undefined;
+        if (!province || (level >= 2 && !city) || (level === 3 && !district)) return false;
+        const key = JSON.stringify([province, city || null, district || null]);
+        if (this.leafFilterKey === key) {
+            // Remove the leaf condition before restoring the parent region.
+            // Field filters and selection identities must not be mixed for toggling.
+            this.leafFilterKey = "";
+            this.drillSelectionActive = false;
+            this.host.applyJsonFilter(null, "general", "filter", powerbi.FilterAction.remove);
+            this.activeFilterDepth = 0;
+            if (level === 3) return this.applyHierarchyFilter(province, this.currentDrillIsMunicipality ? undefined : city);
+            if (level === 2) return this.applyHierarchyFilter(province);
+            return true;
+        }
+        if (!await this.applyHierarchyFilter(province, city, district)) return false;
+        this.leafFilterKey = key;
+        return true;
     }
 
     /** 按当前下钻层级重新应用对应的整区域多选（恢复表格联动） */
@@ -1046,16 +1161,15 @@ export class Visual implements IVisual {
             return;
         }
 
-        const cityAgg = new Map<string, { total: number; firstIdx: number }>();
+        const cityAgg = new Map<string, { total: number; firstIdx: number; indices: number[] }>();
         for (let i = 0; i < provinceNames.length; i++) {
             if (provinceNames[i] !== provinceName
                 && MapDataService.normalizeRegionName(provinceNames[i]) !== MapDataService.normalizeRegionName(provinceName)) continue;
-            const value = values[i] ?? 0;
-            if (isNaN(value)) continue;
+            const value = values[i] ?? NaN;
             const city = cityNames[i];
             const existing = cityAgg.get(city);
-            if (existing) { existing.total += value; }
-            else { cityAgg.set(city, { total: value, firstIdx: i }); }
+            if (existing) { existing.total = addValues(existing.total, value); existing.indices.push(i); }
+            else { cityAgg.set(city, { total: value, firstIdx: i, indices: [i] }); }
         }
         if (cityAgg.size === 0) return;
 
@@ -1063,12 +1177,12 @@ export class Visual implements IVisual {
         let minVal = Infinity, maxVal = -Infinity;
         cityAgg.forEach((info, cityName) => {
             const sid = this.createRowSelectionId(info.firstIdx, 1);
-            const dataPoint: DataPoint = { name: cityName, value: info.total, selectionId: sid };
-            const tooltips = this.buildTooltipData([info.firstIdx])[0];
+            const dataPoint: DataPoint = { name: cityName, value: info.total, selectionId: sid, rowIndices: info.indices };
+            const tooltips = this.buildAggregateTooltip(info.indices);
             if (tooltips?.length) dataPoint.tooltips = tooltips;
             cityDataPoints.push(dataPoint);
-            minVal = Math.min(minVal, info.total);
-            maxVal = Math.max(maxVal, info.total);
+            if (Number.isFinite(info.total)) minVal = Math.min(minVal, info.total);
+            if (Number.isFinite(info.total)) maxVal = Math.max(maxVal, info.total);
         });
         [minVal, maxVal] = this.expandDegenerateRange(minVal, maxVal);
 
@@ -1092,15 +1206,14 @@ export class Visual implements IVisual {
         const districtNames = this.rawCatNames[2];
         const values = this.rawMeasureValues;
 
-        const districtAgg = new Map<string, { total: number; firstIdx: number }>();
+        const districtAgg = new Map<string, { total: number; firstIdx: number; indices: number[] }>();
         for (let i = 0; i < provinceNames.length; i++) {
             if (MapDataService.normalizeRegionName(provinceNames[i]) !== normProvince) continue;
-            const value = values[i] ?? 0;
-            if (isNaN(value)) continue;
+            const value = values[i] ?? NaN;
             const district = districtNames[i];
             const existing = districtAgg.get(district);
-            if (existing) { existing.total += value; }
-            else { districtAgg.set(district, { total: value, firstIdx: i }); }
+            if (existing) { existing.total = addValues(existing.total, value); existing.indices.push(i); }
+            else { districtAgg.set(district, { total: value, firstIdx: i, indices: [i] }); }
         }
         if (districtAgg.size === 0) return;
 
@@ -1108,12 +1221,12 @@ export class Visual implements IVisual {
         let minVal = Infinity, maxVal = -Infinity;
         districtAgg.forEach((info, name) => {
             const sid = this.createRowSelectionId(info.firstIdx, 2);
-            const dataPoint: DataPoint = { name, value: info.total, selectionId: sid };
-            const tooltips = this.buildTooltipData([info.firstIdx])[0];
+            const dataPoint: DataPoint = { name, value: info.total, selectionId: sid, rowIndices: info.indices };
+            const tooltips = this.buildAggregateTooltip(info.indices);
             if (tooltips?.length) dataPoint.tooltips = tooltips;
             districtDataPoints.push(dataPoint);
-            minVal = Math.min(minVal, info.total);
-            maxVal = Math.max(maxVal, info.total);
+            if (Number.isFinite(info.total)) minVal = Math.min(minVal, info.total);
+            if (Number.isFinite(info.total)) maxVal = Math.max(maxVal, info.total);
         });
         [minVal, maxVal] = this.expandDegenerateRange(minVal, maxVal);
 
@@ -1139,16 +1252,16 @@ export class Visual implements IVisual {
         const districtNames = this.rawCatNames[2];
         const values = this.rawMeasureValues;
 
-        const districtAgg = new Map<string, { total: number; firstIdx: number }>();
+        const districtAgg = new Map<string, { total: number; firstIdx: number; indices: number[] }>();
         for (let i = 0; i < cityNames.length; i++) {
+            if (this.currentDrillProvinceName && MapDataService.normalizeRegionName(this.rawCatNames[0][i]) !== MapDataService.normalizeRegionName(this.currentDrillProvinceName)) continue;
             if (cityNames[i] !== cityName
                 && MapDataService.normalizeRegionName(cityNames[i]) !== MapDataService.normalizeRegionName(cityName)) continue;
-            const value = values[i] ?? 0;
-            if (isNaN(value)) continue;
+            const value = values[i] ?? NaN;
             const district = districtNames[i];
             const existing = districtAgg.get(district);
-            if (existing) { existing.total += value; }
-            else { districtAgg.set(district, { total: value, firstIdx: i }); }
+            if (existing) { existing.total = addValues(existing.total, value); existing.indices.push(i); }
+            else { districtAgg.set(district, { total: value, firstIdx: i, indices: [i] }); }
         }
         if (districtAgg.size === 0) {
             await this.crossFilter(cityName);
@@ -1159,12 +1272,12 @@ export class Visual implements IVisual {
         let minVal = Infinity, maxVal = -Infinity;
         districtAgg.forEach((info, name) => {
             const sid = this.createRowSelectionId(info.firstIdx, 2);
-            const dataPoint: DataPoint = { name, value: info.total, selectionId: sid };
-            const tooltips = this.buildTooltipData([info.firstIdx])[0];
+            const dataPoint: DataPoint = { name, value: info.total, selectionId: sid, rowIndices: info.indices };
+            const tooltips = this.buildAggregateTooltip(info.indices);
             if (tooltips?.length) dataPoint.tooltips = tooltips;
             districtDataPoints.push(dataPoint);
-            minVal = Math.min(minVal, info.total);
-            maxVal = Math.max(maxVal, info.total);
+            if (Number.isFinite(info.total)) minVal = Math.min(minVal, info.total);
+            if (Number.isFinite(info.total)) maxVal = Math.max(maxVal, info.total);
         });
         [minVal, maxVal] = this.expandDegenerateRange(minVal, maxVal);
 
@@ -1230,15 +1343,19 @@ export class Visual implements IVisual {
     }
 
     /**
-     * 用一到两个字段过滤条件替代按明细行批量多选。
+     * 用一到三个字段过滤条件替代按明细行批量多选。
      * 对大省份而言，宿主需要处理的身份数量由明细行数降为常量级。
      */
-    private async applyHierarchyFilter(provinceName: string, cityName?: string): Promise<boolean> {
-        if (!this.provinceFilterTarget || (cityName && !this.cityFilterTarget)) return false;
+    private async applyHierarchyFilter(provinceName: string, cityName?: string, districtName?: string): Promise<boolean> {
+        if (!this.provinceFilterTarget || (cityName && !this.cityFilterTarget)
+            || (districtName && (!cityName || !this.districtFilterTarget))) return false;
 
         const filters: any[] = [this.createBasicFilter(this.provinceFilterTarget, provinceName)];
         if (cityName && this.cityFilterTarget) {
             filters.push(this.createBasicFilter(this.cityFilterTarget, cityName));
+        }
+        if (districtName && this.districtFilterTarget) {
+            filters.push(this.createBasicFilter(this.districtFilterTarget, districtName));
         }
 
         this.applyingDrillSelection = true;
@@ -1247,7 +1364,13 @@ export class Visual implements IVisual {
                 await this.selectionManager.clear();
             }
             this.drillSelectionActive = false;
+            // Returning to a parent must also remove the old child-column condition.
+            if (this.activeFilterDepth > filters.length) {
+                this.host.applyJsonFilter(null, "general", "filter", powerbi.FilterAction.remove);
+            }
             this.host.applyJsonFilter(filters, "general", "filter", powerbi.FilterAction.merge);
+            this.activeFilterDepth = filters.length;
+            this.leafFilterKey = "";
             return true;
         } catch (error) {
             console.warn("[ChinaMap] 应用层级过滤失败，回退到行选择:", error);
@@ -1354,9 +1477,11 @@ export class Visual implements IVisual {
         dataPoints: DataPoint[], minVal: number, maxVal: number
     ): Promise<void> {
         if (!this.chart) return;
+        const revision = ++this.renderRevision;
         this.showLoading();
         try {
             const geoJson = await this.mapDataService.getGeoJSON(adcode);
+            if (revision !== this.renderRevision || !this.chart) return;
             const mapName = `map_${adcode}`;
             if (!this.registeredMaps.has(adcode)) {
                 echarts.registerMap(mapName, geoJson);
@@ -1396,6 +1521,7 @@ export class Visual implements IVisual {
      *   正值 → [0, v*1.1]；负值 → [v*1.1, 0]；全零 → [0, 1]
      */
     private expandDegenerateRange(minValue: number, maxValue: number): [number, number] {
+        if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) return [0, 1];
         if (minValue !== maxValue) return [minValue, maxValue];
         if (maxValue > 0) return [0, maxValue * 1.1];
         if (maxValue < 0) return [maxValue * 1.1, 0];
@@ -1457,7 +1583,9 @@ export class Visual implements IVisual {
 
     /** 清理只属于内部下钻的导航和联动状态。 */
     private resetDrillTracking(): void {
+        this.leafFilterKey = "";
         this.currentAdcode = MapDataService.CHINA_ADCODE;
+        this.activeFilterDepth = 0;
         const fmt = this.getFormatConfig();
         this.currentMapName = fmt.southChinaSeaMode === "inset" ? "china_no_scs" : "china";
         this.lastRenderedLevel = 0;
@@ -1525,7 +1653,7 @@ export class Visual implements IVisual {
 
     private buildRestoreState(level: number, parentName: string, dataPoints: DataPoint[]): DrillState {
         let minV = Infinity, maxV = -Infinity;
-        for (const dp of dataPoints) { minV = Math.min(minV, dp.value); maxV = Math.max(maxV, dp.value); }
+        for (const dp of dataPoints) { if (!Number.isFinite(dp.value)) continue; minV = Math.min(minV, dp.value); maxV = Math.max(maxV, dp.value); }
         [minV, maxV] = this.expandDegenerateRange(minV, maxV);
         return { level, parentName, parentAdcode: MapDataService.CHINA_ADCODE, mapName: this.currentMapName, dataPoints, minValue: minV, maxValue: maxV };
     }
@@ -1582,9 +1710,16 @@ export class Visual implements IVisual {
 
     private getMeasureName(): string { return this.measureDisplayName; }
     private formatNumber(value: number): string {
-        if (value == null || isNaN(value)) return "0";
+        if (!Number.isFinite(value)) return "无数据";
         return this.formatValue(value, this.measureFormatString);
     }
+    private handleEmptyContextMenu = (event: MouseEvent): void => {
+        event.preventDefault();
+        if (this.lastContextEvent === event) return;
+        void this.selectionManager.showContextMenu({} as powerbi.visuals.ISelectionId,
+            { x: event.clientX, y: event.clientY });
+    };
+
     private handleResize = (): void => { this.chart?.resize(); };
 
     private showOverlay(message: string, isError: boolean = false): void {
@@ -1592,7 +1727,7 @@ export class Visual implements IVisual {
         const overlay = document.createElement("div");
         overlay.className = `map-overlay${isError ? " error" : ""}`;
         overlay.id = "map-overlay";
-        if (!isError) { const spinner = document.createElement("div"); spinner.className = "spinner"; overlay.appendChild(spinner); }
+        if (!isError && message === "正在加载地图数据...") { const spinner = document.createElement("div"); spinner.className = "spinner"; overlay.appendChild(spinner); }
         const text = document.createElement("div");
         text.textContent = message;
         overlay.appendChild(text);
