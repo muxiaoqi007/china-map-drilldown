@@ -68,6 +68,9 @@ def main():
         files[f"screenshots/{path.name}"] = data
     screenshot_count = sum(name.startswith("screenshots/") for name in files)
     require(screenshot_count <= 5, "At most five store screenshots are allowed")
+    provenance = ROOT / "store/screenshots/provenance.json"
+    if provenance.is_file():
+        files["screenshots/provenance.json"] = provenance.read_bytes()
     for path in sorted((ROOT / "store/evidence").glob("*.png")):
         files[f"evidence/{path.name}"] = path.read_bytes()
     licenses = []

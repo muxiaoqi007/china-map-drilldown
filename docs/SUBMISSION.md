@@ -12,7 +12,7 @@
 | 隐私政策 / EULA | [PRIVACY.md](PRIVACY.md) / [EULA.md](EULA.md)，已公开 |
 | 离线示例数据 | [sample-data.m](sample-data.m)，在空白查询中直接粘贴；另附 CSV |
 | 示例 PBIX | 已提供：`store/sample/china-map-sample-2.3.2.0.pbix`；与提交视觉对象逐字节一致，离线验证待完成 |
-| 截图 | 待从真实 Power BI 界面制作，全国概览、区县联动、格式设置各一张 |
+| 截图 | `store/screenshots/` 已有全国、黑龙江、哈尔滨区县三张1366×768 PNG，每张小于1024 KB；保留原图与处理记录 |
 | 地图来源 / 授权 | [map-data-inventory.csv](map-data-inventory.csv) 记录35份本地地图及哈希，原始来源和再分发授权待核实 |
 | 软件许可 | 打包脚本从锁定的已安装运行依赖中收集 LICENSE / NOTICE，写入附件 `third-party/` |
 | 验证记录 | [VALIDATION.md](VALIDATION.md)；[HOST_VALIDATION.md](HOST_VALIDATION.md) 已记录用户样例的黑龙江/哈尔滨/尚志市 Desktop 实测 |

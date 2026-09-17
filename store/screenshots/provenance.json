@@ -1,0 +1,56 @@
+[
+  {
+    "source": "store/evidence/01-national-raw.png",
+    "sourceSha256": "853e3e03353d5be916639001141bd89527b38f7cee6ac5f5bf9c29dfcb014afb",
+    "cropBounds": [
+      124,
+      174,
+      1287,
+      808
+    ],
+    "offset": [
+      101,
+      67
+    ],
+    "output": "store/screenshots/01-national.png",
+    "bytes": 337065,
+    "sha256": "7bd110d7485af0ab72554f5a68b9439983508dc1952d5a11658b466261a28e4c",
+    "reportPixelsUnchanged": true
+  },
+  {
+    "source": "store/evidence/02-province-raw.png",
+    "sourceSha256": "8471988552f7f74cc69867f3c981b4490b1debc635cae9b958f4bc7afe42fc66",
+    "cropBounds": [
+      137,
+      172,
+      1163,
+      733
+    ],
+    "offset": [
+      170,
+      103
+    ],
+    "output": "store/screenshots/02-province.png",
+    "bytes": 255958,
+    "sha256": "c7d9a201e73e5c3c394c2833c231cca99eb44b596eff720bfa4afd9f1206d4b3",
+    "reportPixelsUnchanged": true
+  },
+  {
+    "source": "store/evidence/03-district-raw.png",
+    "sourceSha256": "90f56c80d82b58a47cd7fa06a7c7711ed17d87c35ee7e1bf9bf562403e125bf2",
+    "cropBounds": [
+      137,
+      172,
+      1163,
+      733
+    ],
+    "offset": [
+      170,
+      103
+    ],
+    "output": "store/screenshots/03-district.png",
+    "bytes": 222855,
+    "sha256": "07a5334837e379b40cf58f055f8cec13bef6c064825beba5fbbb68495fe05f51",
+    "reportPixelsUnchanged": true
+  }
+]
