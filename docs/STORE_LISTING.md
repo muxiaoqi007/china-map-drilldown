@@ -1,14 +1,15 @@
 # AppSource 上架文案草稿
 
 - 名称：中国地图下钻 V2
+- 版本：2.3.2.0
 - 发布者：木小桼
 - 定价：免费，不含应用内付费
 - 支持邮箱：muxiaoqi@outlook.com
 - 支持地址：https://github.com/muxiaoqi007/china-map-drilldown/issues
-- 隐私政策拟用链接：https://github.com/muxiaoqi007/china-map-drilldown/blob/main/docs/PRIVACY.md
-- EULA：本目录 EULA.md
+- 隐私政策：https://github.com/muxiaoqi007/china-map-drilldown/blob/main/docs/PRIVACY.md
+- EULA：https://github.com/muxiaoqi007/china-map-drilldown/blob/main/docs/EULA.md
 
-以上新增文档链接须在对应提交公开后验证可访问，当前本地文件不等于已发布链接。
+支持、隐私政策及 EULA 链接已在2026-09-17通过未登录 HTTP 200 检查。
 
 ## 简介
 
@@ -24,7 +25,7 @@
 
 ## 待制作材料
 
-1. 300×300 PNG 商店 Logo（视觉对象内部20×20图标不能替代商店素材）。
+1. 商店 Logo 已准备：`assets/store/logo-300.png`（300×300 PNG）。
 2. 1–5张1366×768 PNG真实使用截图，每张不超过1024 KB。
 3. 离线可用的示例 PBIX；建议用内置地图演示全国、省份和直辖市区县，示例数据由 Power BI“输入数据”导入，避免外部数据源依赖。
 4. 按 RELEASE_CHECKLIST.md 完成真实宿主测试后，在 Partner Center 创建免费 Power BI visual offer。

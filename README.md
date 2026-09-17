@@ -2,9 +2,7 @@
 
 基于 ECharts 的 Power BI 自定义视觉对象，实现中国地图省→市→区三级 Choropleth 填充地图下钻。
 
-## 演示效果
-
-## 2.3.0.0 发布准备
+## 2.3.2.0 发布准备
 
 本版本按**免费、普通 AppSource 上架**准备，尚未提交或取得微软认证。发布者：木小桼；支持邮箱：muxiaoqi@outlook.com。
 
@@ -15,6 +13,8 @@
 全国和34个省级行政区地图内置；部分区县地图需联网。地图数据再分发授权、离线示例 PBIX、商店截图、真实宿主回归仍待完成。详见 [发布检查清单](docs/RELEASE_CHECKLIST.md)、[上架文案](docs/STORE_LISTING.md)、[隐私政策](docs/PRIVACY.md) 和 [许可协议](docs/EULA.md)。
 
 自动检查：`npm run typecheck`、`npm run lint`、`npm test`、`npm run package`、`npm run audit:security`。
+
+运行 `python scripts/prepare_store.py`（Python 3.9+，仅标准库）生成 `dist/appsource-2.3.2.0-preparation.zip`，内含当前安装包、300×300 Logo、文案、示例数据、第三方软件许可及 SHA-256 清单。该附件包会明确标记尚缺 PBIX、真实截图、地图授权和宿主验证，不代表可直接提交。具体操作见 [提交准备说明](docs/SUBMISSION.md)。
 
 开发环境：Node.js 20.19+；API 5.11.1、pbiviz tools 7.2.1。锁文件已更新；`sockjs` 的 `uuid` 覆盖为兼容 CommonJS 的 11.1.1+ 修复版本，该依赖仅用于开发服务器。
 
@@ -35,12 +35,12 @@
 - 南海诸岛显示模式切换（完整显示 / 小图显示）
 - 颜色渐变图例条（可自定义最小/最大值颜色及范围）
 - 缩放和平移支持
-- 地图 GeoJSON 数据本地打包，Power BI Service 离线可用
+- 全国及省级 GeoJSON 数据本地打包；部分城市到区县地图需要网络访问
 - SVG 渲染器，兼容 Power BI Service CSP 安全策略
 
 ## 技术栈
 
-- Power BI Custom Visuals SDK (pbiviz v5.5.1, API v5.3.0)
+- Power BI Custom Visuals SDK (pbiviz v7.2.1, API v5.11.1)
 - ECharts 6 (SVG renderer)
 - TypeScript (target: ES6)
 - 地图数据：阿里云 DataV.GeoAtlas（已打包本地，回退在线获取）
