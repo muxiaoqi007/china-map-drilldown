@@ -11,11 +11,13 @@
 | 商店文案 | [STORE_LISTING.md](STORE_LISTING.md) |
 | 隐私政策 / EULA | [PRIVACY.md](PRIVACY.md) / [EULA.md](EULA.md)，已公开 |
 | 离线示例数据 | [sample-data.m](sample-data.m)，在空白查询中直接粘贴；另附 CSV |
-| 示例 PBIX | 待按 [SAMPLE_REPORT.md](SAMPLE_REPORT.md) 制作并断网重开验证 |
+| 示例 PBIX | 已提供：`store/sample/china-map-sample-2.3.2.0.pbix`；与提交视觉对象逐字节一致，离线验证待完成 |
 | 截图 | 待从真实 Power BI 界面制作，全国概览、区县联动、格式设置各一张 |
 | 地图来源 / 授权 | [map-data-inventory.csv](map-data-inventory.csv) 记录35份本地地图及哈希，原始来源和再分发授权待核实 |
 | 软件许可 | 打包脚本从锁定的已安装运行依赖中收集 LICENSE / NOTICE，写入附件 `third-party/` |
-| 验证记录 | [VALIDATION.md](VALIDATION.md)；真实宿主执行表见 [HOST_VALIDATION.md](HOST_VALIDATION.md) |
+| 验证记录 | [VALIDATION.md](VALIDATION.md)；[HOST_VALIDATION.md](HOST_VALIDATION.md) 已记录用户样例的黑龙江/哈尔滨/尚志市 Desktop 实测 |
+
+审核测试说明见 [REVIEWER_NOTES.md](REVIEWER_NOTES.md)，后台填写资料见 [PARTNER_CENTER_FIELDS.md](PARTNER_CENTER_FIELDS.md)。用户确认示例中的数据为测试数据，文件可用于上架准备。PBIX 已清除残留地图筛选并保存全国状态。
 
 ## 重新制作附件包
 

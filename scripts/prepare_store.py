@@ -47,6 +47,29 @@ def main():
     for path in sorted((ROOT / "docs").glob("*")):
         if path.is_file():
             files[f"docs/{path.name}"] = path.read_bytes()
+    sample = ROOT / "store/sample" / f"china-map-sample-{version}.pbix"
+    if sample.is_file():
+        with zipfile.ZipFile(sample) as sample_archive:
+            require(sample_archive.testzip() is None, "Corrupt sample PBIX")
+            embedded_path = f"Report/CustomVisuals/{guid}/"
+            require(json.loads(sample_archive.read(embedded_path + "package.json"))["version"]
+                    == version, "Sample visual version mismatch")
+            with zipfile.ZipFile(package) as package_archive:
+                resource_path = meta["resources"][0]["file"]
+                require(sample_archive.read(embedded_path + resource_path)
+                        == package_archive.read(resource_path), "Sample visual differs from package")
+        files[f"sample/{sample.name}"] = sample.read_bytes()
+    for path in sorted((ROOT / "store/screenshots").glob("*.png")):
+        data = path.read_bytes()
+        require(data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR"
+                and struct.unpack(">II", data[16:24]) == (1366, 768),
+                f"Invalid screenshot dimensions: {path.name}")
+        require(len(data) <= 1024 * 1024, f"Screenshot exceeds 1024 KB: {path.name}")
+        files[f"screenshots/{path.name}"] = data
+    screenshot_count = sum(name.startswith("screenshots/") for name in files)
+    require(screenshot_count <= 5, "At most five store screenshots are allowed")
+    for path in sorted((ROOT / "store/evidence").glob("*.png")):
+        files[f"evidence/{path.name}"] = path.read_bytes()
     licenses = []
     for location, entry in sorted(lock["packages"].items()):
         if not location or entry.get("dev") or entry.get("optional"):
@@ -69,9 +92,13 @@ def main():
 
     status = {"version": version, "readyForSubmission": False,
               "pending": ["Map data provenance and redistribution permission",
-                          "Offline sample PBIX", "Real Power BI screenshots",
-                          "Desktop and Service validation", "Partner Center publisher setup"],
+                          "Offline sample PBIX validation", "Real Power BI screenshots",
+                          "Remaining Desktop and Service validation", "Partner Center publisher setup"],
               "note": "Preparation bundle only. No submission or certification has occurred."}
+    status["samplePbixIncluded"] = sample.is_file()
+    status["validatedScreenshotCount"] = screenshot_count
+    if screenshot_count:
+        status["pending"].remove("Real Power BI screenshots")
     files["submission-status.json"] = json.dumps(status, indent=2).encode()
     files["third-party/index.json"] = json.dumps(licenses, indent=2).encode()
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
